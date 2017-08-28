@@ -35,7 +35,7 @@ our %TP_MT = (
 our %TP_DC = (
     name  => 'dyncall_s',
     path  => '3rdparty/dyncall/dyncall',
-    rule  => 'cd 3rdparty/dyncall &&  ./configure && CC=\'$(CC)\' CFLAGS=\'$(CFLAGS)\' $(MAKE) -f Makefile ',
+    rule  => 'cd 3rdparty/dyncall &&  ./configure && CC=\'$(CC)\' CFLAGS=\'-fPIC\' $(MAKE) -f Makefile ',
     clean => 'cd 3rdparty/dyncall && $(MAKE) -f Makefile clean',
 );
 
@@ -265,7 +265,7 @@ our %COMPILERS = (
         cc => 'gcc',
         ld => undef,
 
-        ccmiscflags  => '-Wdeclaration-after-statement -Werror=declaration-after-statement',
+        ccmiscflags  => '-Werror=declaration-after-statement -Werror=pointer-arith',
         ccwarnflags  => '',
         ccoptiflags  => '-O%s -DNDEBUG',
         ccdebugflags => '-g%s',
@@ -292,11 +292,13 @@ our %COMPILERS = (
         ccoptiflags  => '-O%s -DNDEBUG',
         ccdebugflags => '-g%s',
         ccinstflags  => '-fsanitize=address',
+        cc_covflags => '-fprofile-instr-generate -fcoverage-mapping',
 
         ldmiscflags  => '',
         ldoptiflags  => undef,
         lddebugflags => undef,
         ldinstflags  => undef,
+        ld_covflags => '-fprofile-instr-generate -fcoverage-mapping',
 
         noreturnspecifier => '',
         noreturnattribute => '__attribute__((noreturn))',

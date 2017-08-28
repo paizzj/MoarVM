@@ -1,12 +1,12 @@
 #include "moar.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
+static const MVMREPROps CArray_this_repr;
 
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st = MVM_gc_allocate_stable(tc, &CArray_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
@@ -359,19 +359,19 @@ static void bind_pos(MVMThreadContext *tc, MVMSTable *st, MVMObject *root, void 
             if (REPR(value.o)->ID != MVM_REPR_ID_MVMCPointer)
                 MVM_exception_throw_adhoc(tc, "CArray of CPointer passed non-CPointer object");
             bind_wrapper_and_ptr(tc, root, body, index, value.o,
-                ((MVMCPointer *)value.o)->body.ptr);
+                IS_CONCRETE(value.o) ? ((MVMCPointer *)value.o)->body.ptr : NULL);
             break;
         case MVM_CARRAY_ELEM_KIND_CARRAY:
             if (REPR(value.o)->ID != MVM_REPR_ID_MVMCArray)
                 MVM_exception_throw_adhoc(tc, "CArray of CArray passed non-CArray object");
             bind_wrapper_and_ptr(tc, root, body, index, value.o,
-                ((MVMCArray *)value.o)->body.storage);
+                IS_CONCRETE(value.o) ? ((MVMCArray *)value.o)->body.storage : NULL);
             break;
         case MVM_CARRAY_ELEM_KIND_CSTRUCT:
             if (REPR(value.o)->ID != MVM_REPR_ID_MVMCStruct)
                 MVM_exception_throw_adhoc(tc, "CArray of CStruct passed non-CStruct object");
             bind_wrapper_and_ptr(tc, root, body, index, value.o,
-                ((MVMCStruct *)value.o)->body.cstruct);
+                IS_CONCRETE(value.o) ? ((MVMCStruct *)value.o)->body.cstruct : NULL);
             break;
         default:
             MVM_exception_throw_adhoc(tc, "Unknown element type in CArray");
@@ -439,10 +439,10 @@ static void deserialize_repr_data(MVMThreadContext *tc, MVMSTable *st, MVMSerial
 
 /* Initializes the CArray representation. */
 const MVMREPROps * MVMCArray_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &CArray_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps CArray_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     initialize,
@@ -462,7 +462,9 @@ static const MVMREPROps this_repr = {
         MVM_REPR_DEFAULT_BIND_POS_MULTIDIM,
         MVM_REPR_DEFAULT_DIMENSIONS,
         MVM_REPR_DEFAULT_SET_DIMENSIONS,
-        MVM_REPR_DEFAULT_GET_ELEM_STORAGE_SPEC
+        MVM_REPR_DEFAULT_GET_ELEM_STORAGE_SPEC,
+        MVM_REPR_DEFAULT_POS_AS_ATOMIC,
+        MVM_REPR_DEFAULT_POS_AS_ATOMIC_MULTIDIM
     },    /* pos_funcs */
     MVM_REPR_DEFAULT_ASS_FUNCS,
     elems,

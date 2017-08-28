@@ -143,18 +143,17 @@ MVMString * MVM_dir_cwd(MVMThreadContext *tc) {
 
     return MVM_string_utf8_c8_decode(tc, tc->instance->VMString, path, strlen(path));
 }
-
+int MVM_dir_chdir_C_string(MVMThreadContext *tc, const char *dirstring) {
+    return uv_chdir(dirstring);
+}
 /* Change directory. */
 void MVM_dir_chdir(MVMThreadContext *tc, MVMString *dir) {
-    char * const dirstring = MVM_string_utf8_c8_encode_C_string(tc, dir);
-
-    if (uv_chdir((const char *)dirstring) != 0) {
-        int chdir_error = errno;
-        MVM_free(dirstring);
+    const char *dirstring = MVM_string_utf8_c8_encode_C_string(tc, dir);
+    int chdir_error = MVM_dir_chdir_C_string(tc, dirstring);
+    MVM_free((void*)dirstring);
+    if (chdir_error) {
         MVM_exception_throw_adhoc(tc, "chdir failed: %s", uv_strerror(chdir_error));
     }
-
-    MVM_free(dirstring);
 }
 
 /* Structure to keep track of directory iteration state. */
@@ -165,14 +164,7 @@ typedef struct {
 #else
     DIR     *dir_handle;
 #endif
-    MVMuint8 encoding;
 } MVMIODirIter;
-
-/* Sets the encoding used for reading the directory listing. */
-static void set_encoding(MVMThreadContext *tc, MVMOSHandle *h, MVMint64 encoding) {
-    MVMIODirIter *data = (MVMIODirIter *)h->body.data;
-    data->encoding = encoding;
-}
 
 /* Frees data associated with the directory handle. */
 static void gc_free(MVMThreadContext *tc, MVMObject *h, void *d) {
@@ -192,12 +184,10 @@ static void gc_free(MVMThreadContext *tc, MVMObject *h, void *d) {
     }
 }
 
-/* Ops table for directory iterator; it all works off special ops, so almost
- * no entries. */
-static const MVMIOEncodable encodable = { set_encoding };
+/* Ops table for directory iterator; it all works off special ops, so no entries. */
 static const MVMIOOps op_table = {
     NULL,
-    &encodable,
+    NULL,
     NULL,
     NULL,
     NULL,
@@ -269,7 +259,6 @@ MVMObject * MVM_dir_open(MVMThreadContext *tc, MVMString *dirname) {
     data->dir_handle = dir_handle;
 #endif
 
-    data->encoding = MVM_encoding_type_utf8_c8;
     result->body.ops  = &op_table;
     result->body.data = data;
 
@@ -280,7 +269,7 @@ MVMObject * MVM_dir_open(MVMThreadContext *tc, MVMString *dirname) {
 static MVMOSHandle * get_dirhandle(MVMThreadContext *tc, MVMObject *oshandle, const char *msg) {
     MVMOSHandle *handle = (MVMOSHandle *)oshandle;
     if (REPR(oshandle)->ID != MVM_REPR_ID_MVMOSHandle)
-        MVM_exception_throw_adhoc(tc, "%s requires an object with REPR MVMOSHandle", msg);
+        MVM_exception_throw_adhoc(tc, "%s requires an object with REPR MVMOSHandle (got %s with REPR %s)", msg, STABLE(handle)->debug_name, REPR(handle)->name);
     if (handle->body.ops != &op_table)
         MVM_exception_throw_adhoc(tc, "%s got incorrect kind of handle", msg);
     return handle;
@@ -312,7 +301,7 @@ MVMString * MVM_dir_read(MVMThreadContext *tc, MVMObject *oshandle) {
     else if (FindNextFileW(data->dir_handle, &ffd) != 0)  {
         dir_str = UnicodeToUTF8(ffd.cFileName);
         result  = MVM_string_decode(tc, tc->instance->VMString, dir_str, strlen(dir_str),
-                                    data->encoding);
+                                    MVM_encoding_type_utf8_c8);
         MVM_free(dir_str);
         return result;
     } else {
@@ -323,12 +312,17 @@ MVMString * MVM_dir_read(MVMThreadContext *tc, MVMObject *oshandle) {
     struct dirent *entry;
     errno = 0; /* must reset errno so we won't check old errno */
 
+    if (!data->dir_handle) {
+        MVM_exception_throw_adhoc(tc, "Cannot read a closed dir handle.");
+    }
+
     entry = readdir(data->dir_handle);
 
     if (errno == 0) {
         MVMString *ret = (entry == NULL)
                        ? tc->instance->str_consts.empty
-                       : MVM_string_decode(tc, tc->instance->VMString, entry->d_name, strlen(entry->d_name), data->encoding);
+                       : MVM_string_decode(tc, tc->instance->VMString, entry->d_name,
+                               strlen(entry->d_name), MVM_encoding_type_utf8_c8);
         return ret;
     }
 

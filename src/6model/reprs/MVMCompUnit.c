@@ -2,22 +2,16 @@
 #include "platform/mmap.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
-
-/* Invocation protocol handler. */
-static void invoke_handler(MVMThreadContext *tc, MVMObject *invokee, MVMCallsite *callsite, MVMRegister *args) {
-    MVM_exception_throw_adhoc(tc, "Cannot invoke comp unit object");
-}
+static const MVMREPROps MVMCompUnit_this_repr;
 
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. Also sets the invocation protocol handler in the STable. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st = MVM_gc_allocate_stable(tc, &MVMCompUnit_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
         MVM_ASSIGN_REF(tc, &(st->header), st->WHAT, obj);
-        st->invoke = invoke_handler;
         st->size = sizeof(MVMCompUnit);
     });
 
@@ -215,10 +209,10 @@ static void describe_refs(MVMThreadContext *tc, MVMHeapSnapshotState *ss, MVMSTa
 
 /* Initializes the representation. */
 const MVMREPROps * MVMCompUnit_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &MVMCompUnit_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps MVMCompUnit_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     initialize,

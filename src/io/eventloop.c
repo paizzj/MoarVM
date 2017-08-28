@@ -23,6 +23,24 @@ static void setup_work(MVMThreadContext *tc) {
     });
 }
 
+/* Performs an async emit permit grant on the loop. */
+static void permit_work(MVMThreadContext *tc) {
+    MVMConcBlockingQueue *queue = (MVMConcBlockingQueue *)tc->instance->event_loop_permit_queue;
+    MVMObject *task_arr;
+
+    MVMROOT(tc, queue, {
+        while (!MVM_is_null(tc, task_arr = MVM_concblockingqueue_poll(tc, queue))) {
+            MVMObject *task_obj = MVM_repr_at_pos_o(tc, task_arr, 0);
+            MVMAsyncTask *task = (MVMAsyncTask *)task_obj;
+            if (task->body.ops->permit) {
+                MVMint64 channel = MVM_repr_get_int(tc, MVM_repr_at_pos_o(tc, task_arr, 1));
+                MVMint64 permit = MVM_repr_get_int(tc, MVM_repr_at_pos_o(tc, task_arr, 2));
+                task->body.ops->permit(tc, tc->loop, task_obj, task->body.data, channel, permit);
+            }
+        }
+    });
+}
+
 /* Performs an async cancellation on the loop. */
 static void cancel_work(MVMThreadContext *tc) {
     MVMConcBlockingQueue *queue = (MVMConcBlockingQueue *)tc->instance->event_loop_cancel_queue;
@@ -43,6 +61,7 @@ static void async_handler(uv_async_t *handle) {
     MVMThreadContext *tc = (MVMThreadContext *)handle->data;
     GC_SYNC_POINT(tc);
     setup_work(tc);
+    permit_work(tc);
     cancel_work(tc);
 }
 
@@ -72,13 +91,21 @@ static uv_loop_t *get_or_vivify_loop(MVMThreadContext *tc) {
 
     if (!instance->event_loop_thread) {
         /* Grab starting mutex and ensure we didn't lose the race. */
+        MVM_telemetry_timestamp(tc, "hoping to start an event loop thread");
+        MVM_gc_mark_thread_blocked(tc);
         uv_mutex_lock(&instance->mutex_event_loop_start);
+        MVM_gc_mark_thread_unblocked(tc);
         if (!instance->event_loop_thread) {
             MVMObject *thread, *loop_runner;
             int r;
+            unsigned int interval_id;
+
+            interval_id = MVM_telemetry_interval_start(tc, "creating the event loop thread");
 
             /* Create various bits of state the async event loop thread needs. */
             instance->event_loop_todo_queue   = MVM_repr_alloc_init(tc,
+                instance->boot_types.BOOTQueue);
+            instance->event_loop_permit_queue = MVM_repr_alloc_init(tc,
                 instance->boot_types.BOOTQueue);
             instance->event_loop_cancel_queue = MVM_repr_alloc_init(tc,
                 instance->boot_types.BOOTQueue);
@@ -102,12 +129,16 @@ static uv_loop_t *get_or_vivify_loop(MVMThreadContext *tc) {
                 MVM_thread_run(tc, thread);
 
                 /* Block until we know it's fully started and initialized. */
+                MVM_gc_mark_thread_blocked(tc);
                 uv_sem_wait(&(instance->sem_event_loop_started));
+                MVM_gc_mark_thread_unblocked(tc);
                 uv_sem_destroy(&(instance->sem_event_loop_started));
 
                 /* Make the started event loop thread visible to others. */
                 instance->event_loop_thread = ((MVMThread *)thread)->body.tc;
             });
+
+            MVM_telemetry_interval_stop(tc, interval_id, "created the event loop thread");
         }
         uv_mutex_unlock(&instance->mutex_event_loop_start);
     }
@@ -122,6 +153,39 @@ void MVM_io_eventloop_queue_work(MVMThreadContext *tc, MVMObject *work) {
         MVM_repr_push_o(tc, tc->instance->event_loop_todo_queue, work);
         uv_async_send(tc->instance->event_loop_wakeup);
     });
+}
+
+/* Permits an asynchronous task to emit more events. This is used to provide a
+ * back-pressure mechanism. */
+void MVM_io_eventloop_permit(MVMThreadContext *tc, MVMObject *task_obj,
+                              MVMint64 channel, MVMint64 permits) {
+    if (REPR(task_obj)->ID == MVM_REPR_ID_MVMOSHandle)
+        task_obj = MVM_io_get_async_task_handle(tc, task_obj);
+    if (REPR(task_obj)->ID == MVM_REPR_ID_MVMAsyncTask) {
+        MVMROOT(tc, task_obj, {
+            MVMObject *channel_box = NULL;
+            MVMObject *permits_box = NULL;
+            MVMObject *arr = NULL;
+            MVMROOT(tc, channel_box, {
+            MVMROOT(tc, permits_box, {
+            MVMROOT(tc, arr, {
+                channel_box = MVM_repr_box_int(tc, tc->instance->boot_types.BOOTInt, channel);
+                permits_box = MVM_repr_box_int(tc, tc->instance->boot_types.BOOTInt, permits);
+                arr = MVM_repr_alloc_init(tc, tc->instance->boot_types.BOOTArray);
+                MVM_repr_push_o(tc, arr, task_obj);
+                MVM_repr_push_o(tc, arr, channel_box);
+                MVM_repr_push_o(tc, arr, permits_box);
+                get_or_vivify_loop(tc);
+                MVM_repr_push_o(tc, tc->instance->event_loop_permit_queue, arr);
+                uv_async_send(tc->instance->event_loop_wakeup);
+            });
+            });
+            });
+        });
+    }
+    else {
+        MVM_exception_throw_adhoc(tc, "Can only permit an AsyncTask handle");
+    }
 }
 
 /* Cancels a piece of async work. */

@@ -6,7 +6,7 @@
 
 /* Maps outside-world normalization form codes to our internal set, validating
  * that we got something valid. */
-MVMNormalization MVN_unicode_normalizer_form(MVMThreadContext *tc, MVMint64 form_in) {
+MVMNormalization MVM_unicode_normalizer_form(MVMThreadContext *tc, MVMint64 form_in) {
     switch (form_in) {
     case 1: return MVM_NORMALIZE_NFC;
     case 2: return MVM_NORMALIZE_NFD;
@@ -19,7 +19,7 @@ MVMNormalization MVN_unicode_normalizer_form(MVMThreadContext *tc, MVMint64 form
 /* Takes two objects, which must be of VMArray representation and holding
  * 32-bit integers. Performs normalization to the specified form. */
 static void assert_codepoint_array(MVMThreadContext *tc, const MVMObject *arr, char *error) {
-    if (IS_CONCRETE(arr) && REPR(arr)->ID == MVM_REPR_ID_MVMArray) {
+    if (IS_CONCRETE(arr) && REPR(arr)->ID == MVM_REPR_ID_VMArray) {
         MVMuint8 slot_type = ((MVMArrayREPRData *)STABLE(arr)->REPR_data)->slot_type;
         if (slot_type == MVM_ARRAY_I32 || slot_type == MVM_ARRAY_U32)
             return;
@@ -203,6 +203,8 @@ void MVM_unicode_normalizer_init(MVMThreadContext *tc, MVMNormalizer *n, MVMNorm
     n->buffer_end         = 0;
     n->buffer_norm_end    = 0;
     n->translate_newlines = 0;
+    n->prepend_buffer     = 0;
+    n->regional_indicator = 0;
     switch (n->form) {
         case MVM_NORMALIZE_NFD:
             n->first_significant    = MVM_NORMALIZE_FIRST_SIG_NFD;
@@ -327,15 +329,10 @@ static MVMint64 passes_quickcheck(MVMThreadContext *tc, const MVMNormalizer *n, 
     return pval && pval[0] == 'Y';
 }
 
-MVM_STATIC_INLINE MVMint32 fast_atoi( const char * dec_str ) {
-    MVMint32 value = 0;
-    while( *dec_str ) {
-        value = value*10 + (*dec_str++ - '0');
-    }
-    return value;
-}
-/* Gets the canonical combining class for a codepoint. */
-static MVMint64 ccc(MVMThreadContext *tc, MVMCodepoint cp) {
+/* Gets the CCC (actual value) but is slower as it looks up with string properties
+ * Exact values are not needed for normalization.
+ * Returns 0 for Not_Reordered codepoints *and* CCC 0 codepoints */
+static MVMint64 ccc_old(MVMThreadContext *tc, MVMCodepoint cp) {
     if (cp < MVM_NORMALIZE_FIRST_NONZERO_CCC) {
         return 0;
     }
@@ -344,15 +341,30 @@ static MVMint64 ccc(MVMThreadContext *tc, MVMCodepoint cp) {
         return !ccc_str || strlen(ccc_str) > 3 ? 0 : fast_atoi(ccc_str);
     }
 }
+/* Gets the canonical combining class for a codepoint. Does a shortcut
+ * since CCC is stored as a string property, though because they are all sorted
+ * numerically it is ok to get the internal integer value as stored instead of
+ * the string.
+ * Returns 0 for Not_Reordered codepoints *and* CCC 0 codepoints */
+MVMint64 MVM_unicode_relative_ccc(MVMThreadContext *tc, MVMCodepoint cp) {
+    if (cp < MVM_NORMALIZE_FIRST_NONZERO_CCC) {
+        return 0;
+    }
+    else {
+        int ccc_int = MVM_unicode_codepoint_get_property_int(tc, cp, MVM_UNICODE_PROPERTY_CANONICAL_COMBINING_CLASS);
+        return ccc_int <= MVM_UNICODE_PVALUE_CCC_0 ? 0 : ccc_int - MVM_UNICODE_PVALUE_CCC_0;
+    }
+}
 
 /* Checks if the thing we have is a control character (for the definition in
- * the Unicode Standard Annex #29). Assumes it doesn't have to care about any
- * of the controls in the Latin-1 range, because those were already covered in
- * a fast path. */
-static MVMint32 is_control_beyond_latin1(MVMThreadContext *tc, MVMCodepoint in) {
-    /* U+200C ZERO WIDTH NON-JOINER and U+200D ZERO WIDTH JOINER are excluded. */
+ * the Unicode Standard Annex #29). Full path. Fast path checks for controls
+ * in the Latin-1 range. This works for those as well but needs a property lookup */
+MVMint32 MVM_string_is_control_full(MVMThreadContext *tc, MVMCodepoint in) {
+    /* U+200C ZERO WIDTH NON-JOINER and U+200D ZERO WIDTH JOINER are excluded because
+     * they are Cf but not Control's */
     if (in != UNI_CP_ZERO_WIDTH_NON_JOINER && in != UNI_CP_ZERO_WIDTH_JOINER) {
-        /* Consider general property. */
+        /* Consider general property:
+         * Cc, Zl, Zp, and Cn which are also Default_Ignorable_Code_Point=True */
         const char *genprop = MVM_unicode_codepoint_get_property_cstr(tc, in,
             MVM_UNICODE_PROPERTY_GENERAL_CATEGORY);
         switch (genprop[0]) {
@@ -388,8 +400,8 @@ static void canonical_sort(MVMThreadContext *tc, MVMNormalizer *n, MVMint32 from
         MVMint32 i = from;
         reordered = 0;
         while (i < to - 1) {
-            MVMint64 cccA = ccc(tc, n->buffer[i]);
-            MVMint64 cccB = ccc(tc, n->buffer[i + 1]);
+            MVMint64 cccA = MVM_unicode_relative_ccc(tc, n->buffer[i]);
+            MVMint64 cccB = MVM_unicode_relative_ccc(tc, n->buffer[i + 1]);
             if (cccA > cccB && cccB > 0) {
                 MVMCodepoint tmp = n->buffer[i];
                 n->buffer[i] = n->buffer[i + 1];
@@ -407,11 +419,11 @@ static void canonical_composition(MVMThreadContext *tc, MVMNormalizer *n, MVMint
     while (c_idx < to) {
         /* Search for the last non-blocked starter. */
         MVMint32 ss_idx = c_idx - 1;
-        MVMint32 c_ccc  = ccc(tc, n->buffer[c_idx]);
+        MVMint32 c_ccc  = MVM_unicode_relative_ccc(tc, n->buffer[c_idx]);
         while (ss_idx >= from) {
             /* Make sure we don't go past a code point that blocks a starter
              * from the current character we're considering. */
-            MVMint32 ss_ccc = ccc(tc, n->buffer[ss_idx]);
+            MVMint32 ss_ccc = MVM_unicode_relative_ccc(tc, n->buffer[ss_idx]);
             if (ss_ccc >= c_ccc && ss_ccc != 0)
                 break;
 
@@ -496,13 +508,7 @@ static void canonical_composition(MVMThreadContext *tc, MVMNormalizer *n, MVMint
  * the handling of breaking around controls much earlier, so don't have to
  * consider that case. */
 static MVMint32 maybe_hangul(MVMCodepoint cp) {
-    return cp >= 0x1100 && cp < 0x1200 || cp >= 0xA960 && cp < 0xD7FC;
-}
-static MVMint32 is_regional_indicator(MVMCodepoint cp) {
-    /* U+1F1E6 REGIONAL INDICATOR SYMBOL LETTER A
-     * ..
-     * U+1F1FF REGIONAL INDICATOR SYMBOL LETTER Z */
-    return cp >= 0x1F1E6 && cp <= 0x1F1FF;
+    return (0x1100 <= cp  && cp < 0x1200) || (0xA960 <= cp && cp < 0xD7FC);
 }
 static MVMint32 is_grapheme_extend(MVMThreadContext *tc, MVMCodepoint cp) {
     return MVM_unicode_codepoint_get_property_int(tc, cp,
@@ -512,23 +518,12 @@ static MVMint32 is_grapheme_prepend(MVMThreadContext *tc, MVMCodepoint cp) {
     return MVM_unicode_codepoint_get_property_int(tc, cp,
         MVM_UNICODE_PROPERTY_PREPENDED_CONCATENATION_MARK);
 }
-
-static MVMint32 is_spacing_mark(MVMThreadContext *tc, MVMCodepoint cp) {
-    const char *genprop = MVM_unicode_codepoint_get_property_cstr(tc, cp,
-        MVM_UNICODE_PROPERTY_GENERAL_CATEGORY);
-    if (genprop[0] == 'M' && genprop[1] == 'c') {
-        const char *gcb = MVM_unicode_codepoint_get_property_cstr(tc, cp,
-            MVM_UNICODE_PROPERTY_GRAPHEME_CLUSTER_BREAK);
-        return strcmp(gcb, "Extend") != 0;
-    }
-    else {
-        /* Special cases outside of Mc:
-         * U+0E33 THAI CHARACTER SARA AM
-         * U+0EB3 LAO VOWEL SIGN AM */
-        return cp == 0x0E33 || cp == 0x0EB3;
-    }
-}
-static MVMint32 should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint b) {
+/* Returns 0 if the two graphemes should be combined and returns 1 or 2 if
+ * the graphemes should break. 2 is returned if more than the currenly seen
+ * graphemes may be needed to determine the breaking (this is only needed if
+ * we are checking two arbitrary codepoints. If we are normalizing linearly from
+ * the start of the string this has no more significance than returning 1) */
+MVMint32 MVM_unicode_normalize_should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint b, MVMNormalizer *norm) {
     int GCB_a = MVM_unicode_codepoint_get_property_int(tc, a, MVM_UNICODE_PROPERTY_GRAPHEME_CLUSTER_BREAK);
     int GCB_b = MVM_unicode_codepoint_get_property_int(tc, b, MVM_UNICODE_PROPERTY_GRAPHEME_CLUSTER_BREAK);
     /* Don't break between \r and \n, but otherwise break around \r. */
@@ -537,33 +532,29 @@ static MVMint32 should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint 
     if (a == 0x0D || b == 0x0D)
         return 1;
 
-    /* Hangul. Avoid property lookup with a couple of quick range checks. */
-    if (maybe_hangul(a) && maybe_hangul(b)) {
-        const char *hst_a = MVM_unicode_codepoint_get_property_cstr(tc, a,
-            MVM_UNICODE_PROPERTY_HANGUL_SYLLABLE_TYPE);
-        const char *hst_b = MVM_unicode_codepoint_get_property_cstr(tc, b,
-            MVM_UNICODE_PROPERTY_HANGUL_SYLLABLE_TYPE);
-        if (strcmp(hst_a, "L") == 0)
-            return !(strcmp(hst_b, "L") == 0 || strcmp(hst_b, "V") == 0 ||
-                     strcmp(hst_b, "LV") == 0 || strcmp(hst_b, "LVT") == 0);
-        else if (strcmp(hst_a, "LV") == 0 || strcmp(hst_a, "V") == 0)
-            return !(strcmp(hst_b, "V") == 0 || strcmp(hst_b, "T") == 0);
-        else if (strcmp(hst_a, "LVT") == 0 || strcmp(hst_a, "T") == 0)
-            return !(strcmp(hst_b, "T") == 0);
-    }
-
     switch (GCB_a) {
         case MVM_UNICODE_PVALUE_GCB_REGIONAL_INDICATOR:
-            if ( GCB_b == MVM_UNICODE_PVALUE_GCB_REGIONAL_INDICATOR )
+            if (2 <= norm->regional_indicator) {
+                norm->regional_indicator = 0;
+                if (GCB_b == MVM_UNICODE_PVALUE_GCB_REGIONAL_INDICATOR)
+                /* Return 2 here so is_concat_stable can know to run re_nfg */
+                    return 2;
+            }
+            if (GCB_b == MVM_UNICODE_PVALUE_GCB_REGIONAL_INDICATOR) {
+                if (!norm->regional_indicator)
+                    norm->regional_indicator = 2;
+                else
+                    norm->regional_indicator++;
                 return 0;
+            }
             break;
         /* Don't break after Prepend Grapheme_Cluster_Break=Prepend */
         case MVM_UNICODE_PVALUE_GCB_PREPEND:
-            // If it's a control character remember to break
-            if (is_control_beyond_latin1(tc, b )) {
+            /* If it's a control character remember to break */
+            if (MVM_string_is_control_full(tc, b )) {
                 return 1;
             }
-            // Otherwise don't break
+            /* Otherwise don't break */
             return 0;
         /* Don't break after ZWJ for E_Base_GAZ or Glue_After_ZWJ */
         case MVM_UNICODE_PVALUE_GCB_ZWJ:
@@ -575,6 +566,15 @@ static MVMint32 should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint 
             }
             if ( b == UNI_CP_FEMALE_SIGN || b == UNI_CP_MALE_SIGN )
                 return 0;
+            /* Don't break after ZWJ for Emoji property characters that have
+             * GCB=Other. This is *not* a unicode text segmentation rule but
+             * is needed to not break inside Emoji sequences. As the rule to
+             * not break in Emoji sequences is specified by Unicode to need
+             * customization to perform properly. */
+            if (GCB_b == MVM_UNICODE_PVALUE_GCB_OTHER
+            && 127 < b /* Numbers and # have property Emoji. So make sure we're not in ASCII range */
+            && MVM_unicode_codepoint_get_property_int(tc, b, MVM_UNICODE_PROPERTY_EMOJI) )
+                return 0;
         case MVM_UNICODE_PVALUE_GCB_E_MODIFIER:
             if (MVM_unicode_codepoint_get_property_int(tc, b, MVM_UNICODE_PROPERTY_EMOJI_MODIFIER_BASE)) {
                 /* Don't break after ZWJ if it's an Emoji Sequence.
@@ -584,6 +584,21 @@ static MVMint32 should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint 
                 if ( b == UNI_CP_FEMALE_SIGN || b == UNI_CP_MALE_SIGN )
                     return 0;
             }
+            break;
+        case MVM_UNICODE_PVALUE_GCB_L:
+            if (GCB_b == MVM_UNICODE_PVALUE_GCB_L  || GCB_b == MVM_UNICODE_PVALUE_GCB_V ||
+                     GCB_b == MVM_UNICODE_PVALUE_GCB_LV || GCB_b == MVM_UNICODE_PVALUE_GCB_LVT)
+                return 0;
+            break;
+        case MVM_UNICODE_PVALUE_GCB_LV:
+        case MVM_UNICODE_PVALUE_GCB_V:
+            if (GCB_b == MVM_UNICODE_PVALUE_GCB_V || GCB_b == MVM_UNICODE_PVALUE_GCB_T)
+                return 0;
+            break;
+        case MVM_UNICODE_PVALUE_GCB_LVT:
+        case MVM_UNICODE_PVALUE_GCB_T:
+            if (GCB_b == MVM_UNICODE_PVALUE_GCB_T)
+                return 0;
             break;
     }
     switch (GCB_b) {
@@ -605,6 +620,11 @@ static MVMint32 should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint 
                  *case MVM_UNICODE_PVALUE_GCB_EXTEND:
                  *    return 0; */
             }
+            if (MVM_unicode_codepoint_get_property_int(tc, a, MVM_UNICODE_PROPERTY_EMOJI_MODIFIER_BASE)) {
+                /* Not all emoji modifiers have E_BASE or E_BASE_GAZ, some cases we need to check the
+                 * Emoji_Modifier_Base property */
+                return 0;
+            }
             break;
         /* Don't break before spacing marks. */
         case MVM_UNICODE_PVALUE_GCB_SPACINGMARK:
@@ -621,7 +641,7 @@ static void grapheme_composition(MVMThreadContext *tc, MVMNormalizer *n, MVMint3
         MVMint32 pos        = from;
         while (pos < to) {
             MVMint32 next_pos = pos + 1;
-            if (next_pos == to || should_break(tc, n->buffer[pos], n->buffer[next_pos])) {
+            if (next_pos == to || MVM_unicode_normalize_should_break(tc, n->buffer[pos], n->buffer[next_pos], n)) {
                 /* Last in buffer or next code point is a non-starter; turn
                  * sequence into a synthetic. */
                 MVMGrapheme32 g = MVM_nfg_codes_to_grapheme(tc, n->buffer + starterish, next_pos - starterish);
@@ -645,22 +665,28 @@ static void grapheme_composition(MVMThreadContext *tc, MVMNormalizer *n, MVMint3
  * significant codepoint identified by a quick check for the target form). We
  * may find the quick check itself is enough; if not, we have to do real work
  * compute the normalization. */
-MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVMNormalizer *n, MVMCodepoint in, MVMCodepoint *out) {
+MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVMNormalizer *norm, MVMCodepoint in, MVMCodepoint *out) {
     MVMint64 qc_in, ccc_in;
     int is_prepend = is_grapheme_prepend(tc, in);
+
+    if (0 < norm->prepend_buffer)
+        norm->prepend_buffer--;
+    if (is_prepend)
+        norm->prepend_buffer = 2;
+
     /* If it's a control character (outside of the range we checked in the
      * fast path) then it's a normalization terminator. */
-    if (in > 0xFF && is_control_beyond_latin1(tc, in) && !is_prepend) {
-        return MVM_unicode_normalizer_process_codepoint_norm_terminator(tc, n, in, out);
+    if (in > 0xFF && MVM_string_is_control_full(tc, in) && !is_prepend) {
+        return MVM_unicode_normalizer_process_codepoint_norm_terminator(tc, norm, in, out);
     }
 
     /* Do a quickcheck on the codepoint we got in and get its CCC. */
-    qc_in  = passes_quickcheck(tc, n, in);
-    ccc_in = ccc(tc, in);
-
-    /* Fast cases when we pass quick check and what we got in has CCC = 0. */
-    if (qc_in && ccc_in == 0) {
-        if (MVM_NORMALIZE_COMPOSE(n->form)) {
+    qc_in  = passes_quickcheck(tc, norm, in);
+    ccc_in = MVM_unicode_relative_ccc(tc, in);
+    /* Fast cases when we pass quick check and what we got in has CCC = 0,
+     * and it does not follow a prepend character. */
+    if (qc_in && ccc_in == 0 && norm->prepend_buffer == 0) {
+        if (MVM_NORMALIZE_COMPOSE(norm->form)) {
             /* We're composing. If we have exactly one thing in the buffer and
              * it also passes the quick check, and both it and the thing in the
              * buffer have a CCC of zero, we can hand back the first of the
@@ -668,11 +694,11 @@ MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVM
              * codepoint coming in. Note that the NFG quick-check property
              * factors in grapheme extenders that don't have a CCC of zero,
              * so we're safe. */
-            if (n->buffer_end - n->buffer_start == 1) {
-                MVMCodepoint maybe_result = n->buffer[n->buffer_start];
-                if (passes_quickcheck(tc, n, maybe_result) && ccc(tc, maybe_result) == 0) {
-                    *out = n->buffer[n->buffer_start];
-                    n->buffer[n->buffer_start] = in;
+            if (norm->buffer_end - norm->buffer_start == 1) {
+                MVMCodepoint maybe_result = norm->buffer[norm->buffer_start];
+                if (passes_quickcheck(tc, norm, maybe_result) && MVM_unicode_relative_ccc(tc, maybe_result) == 0) {
+                    *out = norm->buffer[norm->buffer_start];
+                    norm->buffer[norm->buffer_start] = in;
                     return 1;
                 }
             }
@@ -680,7 +706,7 @@ MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVM
         else {
             /* We're only decomposing. There should probably be nothing in the
              * buffer in this case; if so we can simply return the codepoint. */
-            if (n->buffer_start == n->buffer_end) {
+            if (norm->buffer_start == norm->buffer_end) {
                 *out = in;
                 return 1;
             }
@@ -688,26 +714,26 @@ MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVM
     }
 
     /* If we didn't pass quick check... */
-    if (!qc_in) {
+    if (!qc_in || 0 < norm->prepend_buffer) {
         /* If we're composing, then decompose the last thing placed in the
          * buffer, if any. We need to do this since it may have passed
          * quickcheck, but having seen some character that does pass then we
          * must make sure we decomposed the prior passing one too. */
-        if (MVM_NORMALIZE_COMPOSE(n->form) && n->buffer_end != n->buffer_norm_end && !is_prepend) {
-            MVMCodepoint decomp = n->buffer[n->buffer_end - 1];
-            n->buffer_end--;
-            decomp_codepoint_to_buffer(tc, n, decomp);
+        if (MVM_NORMALIZE_COMPOSE(norm->form) && norm->buffer_end != norm->buffer_norm_end && !is_prepend) {
+            MVMCodepoint decomp = norm->buffer[norm->buffer_end - 1];
+            norm->buffer_end--;
+            decomp_codepoint_to_buffer(tc, norm, decomp);
         }
 
         /* Decompose this new character into the buffer. We'll need to see
          * more before we can go any further. */
-        decomp_codepoint_to_buffer(tc, n, in);
+        decomp_codepoint_to_buffer(tc, norm, in);
         return 0;
     }
 
     /* Since anything we have at this point does pass quick check, add it to
      * the buffer directly. */
-    add_codepoint_to_buffer(tc, n, in);
+    add_codepoint_to_buffer(tc, norm, in);
 
     /* If the codepoint has a CCC that is non-zero, it's not a starter so we
      * should see more before normalizing. */
@@ -716,28 +742,28 @@ MVMint32 MVM_unicode_normalizer_process_codepoint_full(MVMThreadContext *tc, MVM
 
     /* If we don't have at least one codepoint in the buffer, it's too early
      * to hand anything back. */
-    if (n->buffer_end - n->buffer_start <= 1)
+    if (norm->buffer_end - norm->buffer_start <= 1)
         return 0;
 
     /* Perform canonical sorting on everything from the start of the not yet
      * normalized things in the buffer, up to but excluding the quick-check
      * passing thing we just added. */
-    canonical_sort(tc, n, n->buffer_norm_end, n->buffer_end - 1);
+    canonical_sort(tc, norm, norm->buffer_norm_end, norm->buffer_end - 1);
 
     /* Perform canonical composition and grapheme composition if needed. */
-    if (MVM_NORMALIZE_COMPOSE(n->form)) {
-        canonical_composition(tc, n, n->buffer_norm_end, n->buffer_end - 1);
-        if (MVM_NORMALIZE_GRAPHEME(n->form))
-            grapheme_composition(tc, n, n->buffer_norm_end, n->buffer_end - 1);
+    if (MVM_NORMALIZE_COMPOSE(norm->form)) {
+        canonical_composition(tc, norm, norm->buffer_norm_end, norm->buffer_end - 1);
+        if (MVM_NORMALIZE_GRAPHEME(norm->form))
+            grapheme_composition(tc, norm, norm->buffer_norm_end, norm->buffer_end - 1);
     }
 
     /* We've now normalized all except the latest, quick-check-passing
      * codepoint. */
-    n->buffer_norm_end = n->buffer_end - 1;
+    norm->buffer_norm_end = norm->buffer_end - 1;
 
     /* Hand back a codepoint, and flag how many more are available. */
-    *out = n->buffer[n->buffer_start];
-    return n->buffer_norm_end - n->buffer_start++;
+    *out = norm->buffer[norm->buffer_start];
+    return norm->buffer_norm_end - norm->buffer_start++;
 }
 
 /* Push a number of codepoints into the "to normalize" buffer. */
@@ -775,7 +801,9 @@ void MVM_unicode_normalizer_eof(MVMThreadContext *tc, MVMNormalizer *n) {
         if (MVM_NORMALIZE_GRAPHEME(n->form))
             grapheme_composition(tc, n, n->buffer_norm_end, n->buffer_end);
     }
-
+    /* Reset these two to ensure their value doesn't stick around */
+    n->prepend_buffer     = 0;
+    n->regional_indicator = 0;
     /* We've now normalized all that remains. */
     n->buffer_norm_end = n->buffer_end;
 }

@@ -1,5 +1,44 @@
 #include "moar.h"
 
+typedef struct {
+    MVMuint32 items;
+    MVMuint32 start;
+    MVMuint32 alloc;
+
+    MVMProfileCallNode **list;
+} NodeWorklist;
+
+static void add_node(MVMThreadContext *tc, NodeWorklist *list, MVMProfileCallNode *node) {
+    if (list->start + list->items + 1 < list->alloc) {
+        /* Add at the end */
+        list->items++;
+        list->list[list->start + list->items] = node;
+    } else if (list->start > 0) {
+        /* End reached, add to the start now */
+        list->start--;
+        list->list[list->start] = node;
+    } else {
+        /* Filled up the whole list. Make it bigger */
+        list->alloc *= 2;
+        list->list = MVM_realloc(list->list, list->alloc * sizeof(MVMProfileCallNode *));
+    }
+}
+
+static MVMProfileCallNode *take_node(MVMThreadContext *tc, NodeWorklist *list) {
+    MVMProfileCallNode *result = NULL;
+    if (list->items == 0) {
+        MVM_panic(1, "profiler: tried to take a node from an empty node worklist");
+    }
+    if (list->start > 0) {
+        result = list->list[list->start];
+        list->start++;
+    } else {
+        result = list->list[list->start + list->items];
+        list->items--;
+    }
+    return result;
+}
+
 /* Adds an instruction to log an allocation. */
 static void add_allocation_logging(MVMThreadContext *tc, MVMSpeshGraph *g, MVMSpeshBB *bb, MVMSpeshIns *ins) {
     MVMSpeshIns *alloc_ins = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshIns));
@@ -202,10 +241,9 @@ void MVM_profile_instrument(MVMThreadContext *tc, MVMStaticFrame *sf) {
         sf->body.handlers      = sf->body.instrumentation->instrumented_handlers;
         sf->body.bytecode_size = sf->body.instrumentation->instrumented_bytecode_size;
 
-        /* Throw away any specializations; we'll need to reproduce them as
-         * instrumented versions. */
-        sf->body.num_spesh_candidates = 0;
-        sf->body.spesh_candidates     = NULL;
+        /* Throw away any argument guard so we'll never resolve prior
+         * specializations again. */
+        MVM_spesh_arg_guard_discard(tc, sf);
     }
 }
 
@@ -218,8 +256,7 @@ void MVM_profile_ensure_uninstrumented(MVMThreadContext *tc, MVMStaticFrame *sf)
         sf->body.bytecode_size = sf->body.instrumentation->uninstrumented_bytecode_size;
 
         /* Throw away specializations, which may also be instrumented. */
-        sf->body.num_spesh_candidates = 0;
-        sf->body.spesh_candidates     = NULL;
+        MVM_spesh_arg_guard_discard(tc, sf);
 
         /* XXX For now, due to bugs, disable spesh here. */
         tc->instance->spesh_enabled = 0;
@@ -228,9 +265,14 @@ void MVM_profile_ensure_uninstrumented(MVMThreadContext *tc, MVMStaticFrame *sf)
 
 /* Starts instrumted profiling. */
 void MVM_profile_instrumented_start(MVMThreadContext *tc, MVMObject *config) {
-    /* Enable profiling. */
+    /* Wait for specialization thread to stop working, so it won't trip over
+     * bytecode instrumentation, then enable profiling. */
+    uv_mutex_lock(&(tc->instance->mutex_spesh_sync));
+    while (tc->instance->spesh_working != 0)
+        uv_cond_wait(&(tc->instance->cond_spesh_sync), &(tc->instance->mutex_spesh_sync));
     tc->instance->profiling = 1;
     tc->instance->instrumentation_level++;
+    uv_mutex_unlock(&(tc->instance->mutex_spesh_sync));
 }
 
 /* Simple allocation functions. */
@@ -509,18 +551,22 @@ static MVMObject * dump_data(MVMThreadContext *tc) {
 
 /* Ends profiling, builds the result data structure, and returns it. */
 MVMObject * MVM_profile_instrumented_end(MVMThreadContext *tc) {
-    /* If we have any call frames still on the profile stack, exit them. */
-    while (tc->prof_data->current_call)
-        MVM_profile_log_exit(tc);
+    if (tc->prof_data) {
+        /* If we have any call frames still on the profile stack, exit them. */
+        while (tc->prof_data->current_call)
+            MVM_profile_log_exit(tc);
+
+        /* Record end time. */
+        tc->prof_data->end_time = uv_hrtime();
+    }
 
     /* Disable profiling. */
-    /* XXX Needs to account for multiple threads. */
+    uv_mutex_lock(&(tc->instance->mutex_spesh_sync));
+    while (tc->instance->spesh_working != 0)
+        uv_cond_wait(&(tc->instance->cond_spesh_sync), &(tc->instance->mutex_spesh_sync));
     tc->instance->profiling = 0;
     tc->instance->instrumentation_level++;
-
-    /* Record end time. */
-    if (tc->prof_data)
-        tc->prof_data->end_time = uv_hrtime();
+    uv_mutex_unlock(&(tc->instance->mutex_spesh_sync));
 
     /* Build and return result data structure. */
     return dump_data(tc);
@@ -528,15 +574,31 @@ MVMObject * MVM_profile_instrumented_end(MVMThreadContext *tc) {
 
 
 /* Marks objects held in the profiling graph. */
-static void mark_call_graph_node(MVMThreadContext *tc, MVMProfileCallNode *node, MVMGCWorklist *worklist) {
+static void mark_call_graph_node(MVMThreadContext *tc, MVMProfileCallNode *node, NodeWorklist *nodelist, MVMGCWorklist *worklist) {
     MVMuint32 i;
     MVM_gc_worklist_add(tc, worklist, &(node->sf));
     for (i = 0; i < node->num_alloc; i++)
         MVM_gc_worklist_add(tc, worklist, &(node->alloc[i].type));
     for (i = 0; i < node->num_succ; i++)
-        mark_call_graph_node(tc, node->succ[i], worklist);
+        add_node(tc, nodelist, node->succ[i]);
 }
 void MVM_profile_instrumented_mark_data(MVMThreadContext *tc, MVMGCWorklist *worklist) {
-    if (tc->prof_data)
-        mark_call_graph_node(tc, tc->prof_data->call_graph, worklist);
+    if (tc->prof_data) {
+        /* Allocate our worklist on the stack. */
+        NodeWorklist nodelist;
+        nodelist.items = 0;
+        nodelist.start = 0;
+        nodelist.alloc = 256;
+        nodelist.list = MVM_malloc(nodelist.alloc * sizeof(MVMProfileCallNode *));
+
+        add_node(tc, &nodelist, tc->prof_data->call_graph);
+
+        while (nodelist.items) {
+            MVMProfileCallNode *node = take_node(tc, &nodelist);
+            if (node)
+                mark_call_graph_node(tc, node, &nodelist, worklist);
+        }
+
+        MVM_free(nodelist.list);
+    }
 }

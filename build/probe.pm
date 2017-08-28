@@ -51,7 +51,7 @@ sub compile {
     my @objs;
     foreach my $file ("$leaf.c", @$files) {
         (my $obj = $file) =~ s/\.c/$config->{obj}/;
-        my $command = "$config->{cc} $cl_define $config->{ccout}$obj $config->{ccswitch} $file >$devnull 2>&1";
+        my $command = "$config->{cc} $ENV{CFLAGS} $cl_define $config->{ccout}$obj $config->{ccswitch} $file >$devnull 2>&1";
         system $command
             and return;
         push @objs, $obj;
@@ -91,7 +91,8 @@ EOT
 
     my ($can_compile, $can_link, $command_errored, $error_message);
     (my $obj = $file) =~ s/\.c/$config->{obj}/;
-    my $command = "$config->{cc} $config->{ccout}$obj $config->{ccswitch} $file 2>&1";
+    $ENV{CFLAGS} //= '';
+    my $command = "$config->{cc} $ENV{CFLAGS} $config->{ccout}$obj $config->{ccswitch} $file 2>&1";
     my $output  = `$command` || $!;
     if ($? >> 8 == 0) {
         $can_compile = 1;
@@ -412,15 +413,21 @@ sub pthread_yield {
     _spew('try.c', <<'EOT');
 #include <stdlib.h>
 #include <pthread.h>
+#include <unistd.h>
 
 int main(int argc, char **argv) {
+#ifdef _POSIX_PRIORITY_SCHEDULING
+    /* hide pthread_yield so we fall back to the recommended sched_yield() */
+    return EXIT_FAILURE;
+#else
     pthread_yield();
     return EXIT_SUCCESS;
+#endif
 }
 EOT
 
     print ::dots('    probing pthread_yield support');
-    my $has_pthread_yield = compile($config, 'try');
+    my $has_pthread_yield = compile($config, 'try') && system('./try') == 0;
     print $has_pthread_yield ? "YES\n": "NO\n";
     $config->{has_pthread_yield} = $has_pthread_yield || 0
 }
@@ -441,6 +448,39 @@ sub win32_compiler_toolchain {
         $config->{win32_compiler_toolchain} = ''
     }
     $config->{win32_compiler_toolchain}
+}
+
+sub rdtscp {
+    my ($config) = @_;
+    my $restore = _to_probe_dir();
+    _spew('try.c', <<'EOT');
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
+int main(int argc, char **argv) {
+    unsigned int _tsc_aux;
+    unsigned int tscValue;
+    tscValue = __rdtscp(&_tsc_aux);
+
+    if (tscValue > 1)
+        return EXIT_SUCCESS;
+    return EXIT_FAILURE;
+}
+EOT
+
+    print ::dots('    probing support of rdtscp intrinsic');
+    my $can_rdtscp = compile($config, 'try');
+    unless ($config->{crossconf}) {
+        $can_rdtscp  &&= !system './try';
+    }
+    print $can_rdtscp ? "YES\n": "NO\n";
+    $config->{canrdtscp} = $can_rdtscp || 0
 }
 
 '00';

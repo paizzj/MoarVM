@@ -1,12 +1,12 @@
 #include "moar.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
+static const MVMREPROps NFA_this_repr;
 
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st = MVM_gc_allocate_stable(tc, &NFA_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
@@ -243,10 +243,10 @@ static MVMuint64 unmanaged_size(MVMThreadContext *tc, MVMSTable *st, void *data)
 
 /* Initializes the representation. */
 const MVMREPROps * MVMNFA_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &NFA_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps NFA_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     NULL, /* initialize */
@@ -337,7 +337,7 @@ MVMObject * MVM_nfa_from_statelist(MVMThreadContext *tc, MVMObject *states, MVMO
                 MVMint64 to  = MVM_coerce_simple_intify(tc,
                     MVM_repr_at_pos_o(tc, edge_info, j + 2));
                 if (to <= 0 && act != MVM_NFA_EDGE_FATE)
-                    MVM_exception_throw_adhoc(tc, "Invalid to edge %ld in NFA statelist", to);
+                    MVM_exception_throw_adhoc(tc, "Invalid to edge %"PRId64" in NFA statelist", to);
 
                 nfa->states[i][cur_edge].act = act;
                 nfa->states[i][cur_edge].to = to;
@@ -397,12 +397,21 @@ MVMObject * MVM_nfa_from_statelist(MVMThreadContext *tc, MVMObject *states, MVMO
 
 /* Does a run of the NFA. Produces a list of integers indicating the
  * chosen ordering. */
+static MVMint32 in_done(MVMuint32 *done, MVMuint32 numdone, MVMuint32 st) {
+    MVMuint32 i = 0;
+    for (i = 0; i < numdone; i++)
+        if (done[i] == st)
+            return 1;
+    return 0;
+}
 static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *target, MVMint64 offset, MVMint64 *total_fates_out) {
     MVMint64  eos     = MVM_string_graphs(tc, target);
-    MVMint64  gen     = 1;
+    MVMuint32 gen     = 1;
     MVMint64  numcur  = 0;
     MVMint64  numnext = 0;
-    MVMint64 *done, *fates, *curst, *nextst, *longlit;
+    MVMint64  numdone = 0;
+    MVMuint32 *done, *curst, *nextst;
+    MVMint64  *fates, *longlit;
     MVMint64  i, fate_arr_len, num_states, total_fates, prev_fates, usedlonglit;
     MVMint64  orig_offset = offset;
     int nfadeb = tc->instance->nfa_debug_enabled;
@@ -411,16 +420,15 @@ static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *
      * states" arrays. */
     num_states = nfa->num_states;
     if (tc->nfa_alloc_states < num_states) {
-        size_t alloc   = (num_states + 1) * sizeof(MVMint64);
-        tc->nfa_done   = (MVMint64 *)MVM_realloc(tc->nfa_done, alloc);
-        tc->nfa_curst  = (MVMint64 *)MVM_realloc(tc->nfa_curst, alloc);
-        tc->nfa_nextst = (MVMint64 *)MVM_realloc(tc->nfa_nextst, alloc);
+        size_t alloc   = (num_states + 1) * sizeof(MVMuint32);
+        tc->nfa_done   = (MVMuint32 *)MVM_realloc(tc->nfa_done, alloc);
+        tc->nfa_curst  = (MVMuint32 *)MVM_realloc(tc->nfa_curst, alloc);
+        tc->nfa_nextst = (MVMuint32 *)MVM_realloc(tc->nfa_nextst, alloc);
         tc->nfa_alloc_states = num_states;
     }
     done   = tc->nfa_done;
     curst  = tc->nfa_curst;
     nextst = tc->nfa_nextst;
-    memset(done, 0, (num_states + 1) * sizeof(MVMint64));
 
     /* Allocate fates array. */
     fate_arr_len = 1 + MVM_repr_elems(tc, nfa->fates);
@@ -444,11 +452,12 @@ static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *
     nextst[numnext++] = 1;
     while (numnext && offset <= eos) {
         /* Swap next and current */
-        MVMint64 *temp = curst;
+        MVMuint32 *temp = curst;
         curst   = nextst;
         nextst  = temp;
         numcur  = numnext;
         numnext = 0;
+        numdone = 0;
 
         /* Save how many fates we have before this position is considered. */
         prev_fates = total_fates;
@@ -456,7 +465,7 @@ static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *
         if (nfadeb) {
             if (offset < eos) {
                 MVMGrapheme32 cp = MVM_string_get_grapheme_at_nocheck(tc, target, offset);
-                fprintf(stderr,"%c with %ds target %lx offset %ld\n",cp,(int)numcur, (long)target, offset);
+                fprintf(stderr,"%c with %ds target %lx offset %"PRId64"\n",cp,(int)numcur, (long)target, offset);
             }
             else {
                 fprintf(stderr,"EOS with %ds\n",(int)numcur);
@@ -468,9 +477,9 @@ static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *
 
             MVMint64 st = curst[--numcur];
             if (st <= num_states) {
-                if (done[st] == gen)
+                if (in_done(done, numdone, st))
                     continue;
-                done[st] = gen;
+                done[numdone++] = st;
             }
 
             edge_info = nfa->states[st - 1];
@@ -528,7 +537,8 @@ static MVMint64 * nqp_nfa_run(MVMThreadContext *tc, MVMNFABody *nfa, MVMString *
                         fates[++j] = arg;
                         continue;
                     }
-                    else if (act == MVM_NFA_EDGE_EPSILON && to <= num_states && done[to] != gen) {
+                    else if (act == MVM_NFA_EDGE_EPSILON && to <= num_states &&
+                            !in_done(done, numdone, to)) {
                         if (to)
                             curst[numcur++] = to;
                         else if (nfadeb)  /* XXX should turn into a "can't happen" after rebootstrap */

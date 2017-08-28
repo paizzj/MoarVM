@@ -213,8 +213,10 @@ static MVMGrapheme32 lookup_or_add_synthetic(MVMThreadContext *tc, MVMCodepoint 
 MVMGrapheme32 MVM_nfg_codes_to_grapheme(MVMThreadContext *tc, MVMCodepoint *codes, MVMint32 num_codes) {
     if (num_codes == 1)
         return codes[0];
-    else
+    else if (num_codes < MVM_GRAPHEME_MAX_CODEPOINTS)
         return lookup_or_add_synthetic(tc, codes, num_codes, 0);
+    else
+        MVM_exception_throw_adhoc(tc, "Too many codepoints (%d) in grapheme", num_codes);
 }
 
 /* Does the same as MVM_nfg_codes_to_grapheme, but flags the added grapheme as
@@ -228,8 +230,7 @@ MVMGrapheme32 MVM_nfg_codes_to_grapheme_utf8_c8(MVMThreadContext *tc, MVMCodepoi
 
 /* Gets the \r\n synthetic. */
 MVMGrapheme32 MVM_nfg_crlf_grapheme(MVMThreadContext *tc) {
-    MVMCodepoint codes[2] = { '\r', '\n' };
-    return lookup_or_add_synthetic(tc, codes, 2, 0);
+    return tc->instance->nfg->crlf_grapheme;
 }
 
 /* Does a lookup of information held about a synthetic. The synth parameter
@@ -240,9 +241,9 @@ MVMNFGSynthetic * MVM_nfg_get_synthetic_info(MVMThreadContext *tc, MVMGrapheme32
     MVMNFGState *nfg       = tc->instance->nfg;
     MVMint32     synth_idx = -synth - 1;
     if (synth >= 0)
-        MVM_panic(1, "MVM_nfg_get_synthetic_info illegally called on codepoint >= 0");
+        MVM_oops(tc, "MVM_nfg_get_synthetic_info illegally called on a non-synthetic codepoint.\nRequested codepoint %i.", synth);
     if (synth_idx >= nfg->num_synthetics)
-        MVM_panic(1, "MVM_nfg_get_synthetic_info called with out-of-range synthetic");
+        MVM_oops(tc, "MVM_nfg_get_synthetic_info call requested a synthetic codepoint that does not exist.\nRequested synthetic %i when only %i have been created.", -synth, nfg->num_synthetics);
     return &(nfg->synthetics[synth_idx]);
 }
 
@@ -341,17 +342,23 @@ MVMuint32 MVM_nfg_get_case_change(MVMThreadContext *tc, MVMGrapheme32 synth, MVM
     }
 }
 
+MVM_STATIC_INLINE MVMint32 passes_quickcheck_and_zero_ccc(MVMThreadContext *tc, MVMCodepoint cp) {
+    return MVM_unicode_codepoint_get_property_int(tc, cp, MVM_UNICODE_PROPERTY_NFG_QC)
+    &&     MVM_unicode_codepoint_get_property_int(tc, cp,
+               MVM_UNICODE_PROPERTY_CANONICAL_COMBINING_CLASS) <= MVM_UNICODE_PVALUE_CCC_0;
+}
+/* Returns true for cps with Grapheme_Cluster_Break = Control */
+MVM_STATIC_INLINE MVMint32 codepoint_GCB_Control (MVMThreadContext *tc, MVMCodepoint codepoint) {
+    return MVM_unicode_codepoint_get_property_int(tc, codepoint,
+        MVM_UNICODE_PROPERTY_GRAPHEME_CLUSTER_BREAK)
+    ==  MVM_UNICODE_PVALUE_GCB_CONTROL;
+}
 /* Returns non-zero if the result of concatenating the two strings will freely
  * leave us in NFG without any further effort. */
-static MVMint32 passes_quickcheck_and_zero_ccc(MVMThreadContext *tc, MVMCodepoint cp) {
-    const char *qc_str  = MVM_unicode_codepoint_get_property_cstr(tc, cp, MVM_UNICODE_PROPERTY_NFG_QC);
-    const char *ccc_str = MVM_unicode_codepoint_get_property_cstr(tc, cp, MVM_UNICODE_PROPERTY_CANONICAL_COMBINING_CLASS);
-    return qc_str && qc_str[0] == 'Y' &&
-        (!ccc_str || strlen(ccc_str) > 3 || (strlen(ccc_str) == 1 && ccc_str[0] == 0));
-}
 MVMint32 MVM_nfg_is_concat_stable(MVMThreadContext *tc, MVMString *a, MVMString *b) {
     MVMGrapheme32 last_a;
     MVMGrapheme32 first_b;
+    MVMGrapheme32 crlf;
 
     /* If either string is empty, we're good. */
     if (a->body.num_graphs == 0 || b->body.num_graphs == 0)
@@ -360,21 +367,59 @@ MVMint32 MVM_nfg_is_concat_stable(MVMThreadContext *tc, MVMString *a, MVMString 
     /* Get first and last graphemes of the strings. */
     last_a = MVM_string_get_grapheme_at_nocheck(tc, a, a->body.num_graphs - 1);
     first_b = MVM_string_get_grapheme_at_nocheck(tc, b, 0);
+    /* Put the case where we are adding a lf or crlf line ending */
+    if (first_b == '\n')
+        /* If we see \r + \n we need to renormalize. Otherwise we're good */
+        return last_a == '\r' ? 0 : 1;
 
-    /* If either is synthetic, assume we'll have to re-normalize (this is an
-     * over-estimate, most likely). Note if you optimize this that it serves
-     * as a guard for what follows. */
+    crlf = MVM_nfg_crlf_grapheme(tc);
+    /* As a control code we are always going to break if we see one of these.
+     * Check first_b for speeding up line endings */
+    if (first_b == crlf || last_a == crlf)
+        return 0;
+    /* If either is synthetic other than "\r\n", assume we'll have to re-normalize
+     * (this is an over-estimate, most likely). Note if you optimize this that it
+     * serves as a guard for what follows.
+     * TODO get the last codepoint of last_a and first codepoint of first_b and call
+     * MVM_unicode_normalize_should_break */
     if (last_a < 0 || first_b < 0)
         return 0;
 
-    /* If both less than the first significant char for NFC, and the first is
-     * not \r, we're good. */
-    if (last_a != 0x0D && last_a < MVM_NORMALIZE_FIRST_SIG_NFC
-                       && first_b < MVM_NORMALIZE_FIRST_SIG_NFC)
+    /* If both less than the first significant char for NFC we are good */
+    if (last_a < MVM_NORMALIZE_FIRST_SIG_NFC && first_b < MVM_NORMALIZE_FIRST_SIG_NFC) {
         return 1;
+    }
+    else {
+        /* Check if the two codepoints would be joined during normalization.
+         * Returns 1 if they would break and thus is safe under concat, or 0 if
+         * they would be joined. */
+        MVMNormalizer norm;
+        int rtrn;
+        MVM_unicode_normalizer_init(tc, &norm, MVM_NORMALIZE_NFG);
+        rtrn = MVM_unicode_normalize_should_break(tc, last_a, first_b, &norm);
+        MVM_unicode_normalizer_cleanup(tc, &norm);
+        /* If both CCC are non-zero then it may need to be reordered. For now return 0.
+         * This can be optimized. */
+        if (MVM_unicode_relative_ccc(tc, last_a) != 0 && MVM_unicode_relative_ccc(tc, first_b) != 0)
+            return 0;
+        return rtrn;
+    }
+}
 
-    /* If either fail quickcheck or have ccc > 0, have to re-normalize. */
-    return passes_quickcheck_and_zero_ccc(tc, last_a) && passes_quickcheck_and_zero_ccc(tc, first_b);
+/* Initialize NFG subsystem. */
+static void cache_crlf(MVMThreadContext *tc) {
+    MVMCodepoint codes[2] = { '\r', '\n' };
+    tc->instance->nfg->crlf_grapheme = lookup_or_add_synthetic(tc, codes, 2, 0);
+}
+void MVM_nfg_init(MVMThreadContext *tc) {
+    int init_stat;
+    tc->instance->nfg = calloc(1, sizeof(MVMNFGState));
+    if ((init_stat = uv_mutex_init(&(tc->instance->nfg->update_mutex))) < 0) {
+        fprintf(stderr, "MoarVM: Initialization of NFG update mutex failed\n    %s\n",
+            uv_strerror(init_stat));
+        exit(1);
+    }
+    cache_crlf(tc);
 }
 
 /* Free all memory allocated to hold synthetic graphemes. These are global

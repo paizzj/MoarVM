@@ -1,12 +1,12 @@
 #include "moar.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
+static const MVMREPROps Semaphore_this_repr;
 
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st  = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st  = MVM_gc_allocate_stable(tc, &Semaphore_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
@@ -71,10 +71,10 @@ static void deserialize_stable_size(MVMThreadContext *tc, MVMSTable *st, MVMSeri
 
 /* Initializes the representation. */
 const MVMREPROps * MVMSemaphore_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &Semaphore_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps Semaphore_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     NULL, /* initialize */
@@ -115,18 +115,24 @@ static const MVMREPROps this_repr = {
 };
 
 MVMint64 MVM_semaphore_tryacquire(MVMThreadContext *tc, MVMSemaphore *sem) {
-    int r = uv_sem_trywait(sem->body.sem);
+    int r;
+    MVM_telemetry_timestamp(tc, "Semaphore.tryAcquire");
+    r = uv_sem_trywait(sem->body.sem);
     return !r;
 }
 
 void MVM_semaphore_acquire(MVMThreadContext *tc, MVMSemaphore *sem) {
+    unsigned int interval_id;
+    interval_id = MVM_telemetry_interval_start(tc, "Semaphore.acquire");
     MVMROOT(tc, sem, {
         MVM_gc_mark_thread_blocked(tc);
         uv_sem_wait(sem->body.sem);
         MVM_gc_mark_thread_unblocked(tc);
     });
+    MVM_telemetry_interval_stop(tc, interval_id, "Semaphore.acquire");
 }
 
 void MVM_semaphore_release(MVMThreadContext *tc, MVMSemaphore *sem) {
+    MVM_telemetry_timestamp(tc, "Semaphore.release");
     uv_sem_post(sem->body.sem);
 }

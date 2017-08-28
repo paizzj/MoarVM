@@ -94,7 +94,6 @@
 |.type COLLECTABLE, MVMCollectable
 |.type STABLE, MVMSTable
 |.type REPR, MVMREPROps
-|.type LEXOTIC, MVMLexotic
 |.type STRING, MVMString*
 |.type OBJECTPTR, MVMObject*
 |.type CONTAINERSPEC, MVMContainerSpec
@@ -102,11 +101,11 @@
 |.type HLLCONFIG, MVMHLLConfig;
 |.type SCREFBODY, MVMSerializationContextBody
 |.type NFGSYNTH, MVMNFGSynthetic
+|.type CODE, MVMCode
 |.type U8, MVMuint8
 |.type U16, MVMuint16
 |.type U32, MVMuint32
 |.type U64, MVMuint64
-
 
 
 /* Static allocation of relevant types to registers. I pick
@@ -433,7 +432,9 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov WORK[dst], TMP1;
         break;
     }
-    case MVM_OP_getlex: {
+    case MVM_OP_getlex:
+    case MVM_OP_sp_getlex_o:
+    case MVM_OP_sp_getlex_ins: {
         MVMuint16 *lexical_types;
         MVMStaticFrame * sf = jg->sg->sf;
         MVMint16 dst = ins->operands[0].reg.orig;
@@ -482,7 +483,42 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov WORK[dst], TMP5;
         break;
     }
-    case MVM_OP_getlex_no: {
+    case MVM_OP_sp_getlexvia_o:
+    case MVM_OP_sp_getlexvia_ins: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 idx = ins->operands[1].lit_ui16;
+        MVMint16 out = ins->operands[2].lit_ui16;
+        MVMint16 via = ins->operands[3].reg.orig;
+        MVMint16 i;
+        /* Resolve the frame. */
+        | mov TMP6, WORK[via];
+        | mov TMP6, CODE:TMP6->body.outer;
+        for (i = 1; i < out; i++) /* From 1 as we are already at outer */
+            | mov TMP6, FRAME:TMP6->outer;
+        /* get array of lexicals */
+        | mov TMP5, FRAME:TMP6->env;
+        /* read value */
+        | mov TMP5, REGISTER:TMP5[idx];
+        if (op == MVM_OP_sp_getlexvia_o) {
+            MVM_jit_log(tc, "Emit lex vifivy check for via code-ref lookup\n");
+            /* if it is zero, check if we need to auto-vivify */
+            | test TMP5, TMP5;
+            | jnz >1;
+            /* setup args */
+            | mov ARG1, TC;
+            | mov ARG2, TMP6;
+            | mov ARG3, idx;
+            | callp &MVM_frame_vivify_lexical;
+            /* use return value for the result */
+            | mov TMP5, RV;
+            |1:
+        }
+        /* store the value */
+        | mov WORK[dst], TMP5;
+        break;
+    }
+    case MVM_OP_getlex_no:
+    case MVM_OP_sp_getlex_no: {
         MVMint16  dst = ins->operands[0].reg.orig;
         MVMuint32 idx = ins->operands[1].lit_str_idx;
         | mov ARG1, TC;
@@ -926,36 +962,47 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov WORK[reg_a], rax;
         break;
     }
-    case MVM_OP_div_i:
+    case MVM_OP_div_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 b   = ins->operands[2].reg.orig;
+        | mov rax, WORK[a];
+        | mov rcx, WORK[b];
+        | cmp rcx, 0;
+        | jnz >1;
+        | throw_adhoc "Division by zero";
+        |1:
+        /* either num < 0, or denom < 0, but not both */
+        | setl dh;
+        | cmp rax, 0;
+        | setl dl;
+        | xor dl, dh;
+        | movzx r8d, dl;
+        | cqo;
+        | idiv rcx;
+        | test rdx, rdx;
+        | setnz cl;
+        | and r8b, cl;
+        /* r8 = bias = (modulo != 0) & ((num < 0) ^ (denom < 0)) */
+        | sub rax, r8;
+        | mov WORK[dst], rax;
+        break;
+    }
     case MVM_OP_mod_i: {
         MVMint16 dst = ins->operands[0].reg.orig;
         MVMint16 a   = ins->operands[1].reg.orig;
         MVMint16 b   = ins->operands[2].reg.orig;
+        | mov rax, WORK[a];
         | mov rcx, WORK[b];
-        | test rcx, rcx;
+        | cmp rcx, 0;
         | jnz >1;
         | throw_adhoc "Division by zero";
         |1:
-        // division is safe, proceed
-        | mov rax, WORK[a];
-        | cqo;  // convert quadword to octoword. look it up :-)
-        | idiv rcx; // rcx was the denominator
-        if (op == MVM_OP_div_i) {
-            | mov TMP3, rax;
-            | sub TMP3, 1;
-            | cmp rax, 0; // quotient < 0
-            | setl ch;
-            | test rdx, rdx; // remainder != 0
-            | setnz cl;
-            | test ch, cl;
-            | cmovnz rax, TMP3;
-            | mov WORK[dst], rax;
-        } else {
-            | mov WORK[dst], rdx;
-        }
+        | cqo;
+        | idiv rcx;
+        | mov WORK[dst], rdx;
         break;
     }
-
     case MVM_OP_inc_i: {
          MVMint32 reg = ins->operands[0].reg.orig;
          | add qword WORK[reg], 1;
@@ -980,6 +1027,24 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov TMP1, WORK[src];
         | neg TMP1;
         | mov WORK[dst], TMP1;
+        break;
+    }
+    case MVM_OP_extend_i32: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        | mov RV, WORK[src];
+        | cdqe
+        | mov WORK[dst], RV;
+        break;
+    }
+    case MVM_OP_trunc_i32: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        | mov TMP1, WORK[src];
+        /* x86-64 auto-truncates the upper 32 bits when using registers in 32
+         * bit mode */
+        | mov TMP2d, TMP1d;
+        | mov WORK[dst], TMP2;
         break;
     }
     case MVM_OP_add_n:
@@ -1253,7 +1318,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         MVMint32 reprid = op == MVM_OP_isint ? MVM_REPR_ID_P6int :
                           op == MVM_OP_isnum ? MVM_REPR_ID_P6num :
                           op == MVM_OP_isstr ? MVM_REPR_ID_P6str :
-                          op == MVM_OP_islist ? MVM_REPR_ID_MVMArray :
+                          op == MVM_OP_islist ? MVM_REPR_ID_VMArray :
                      /*  op == MVM_OP_ishash */ MVM_REPR_ID_MVMHash;
         | mov TMP1, aword WORK[obj];
         | test TMP1, TMP1;
@@ -1372,7 +1437,8 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov aword WORK[dst], RV; // store in local register
         break;
     }
-    case MVM_OP_decont: {
+    case MVM_OP_decont:
+    case MVM_OP_sp_decont: {
         MVMint16 dst = ins->operands[0].reg.orig;
         MVMint16 src = ins->operands[1].reg.orig;
         | mov TMP5, WORK[src];
@@ -1412,13 +1478,6 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | setnz TMP1b;
         | movzx TMP1, TMP1b;
         | mov qword WORK[dst], TMP1;
-        break;
-    }
-    case MVM_OP_sp_namedarg_used: {
-        MVMuint16 param = ins->operands[0].lit_i16;
-        | mov TMP1, TC->cur_frame;
-        | mov TMP1, FRAME:TMP1->params.named_used;
-        | mov byte U8:TMP1[param], 1;
         break;
     }
     case MVM_OP_sp_findmeth: {
@@ -1477,28 +1536,6 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov TMP1, aword TC->last_handler_result;
         | mov aword WORK[dst], TMP1;
         | mov aword TC->last_handler_result, 0;
-        break;
-    }
-    case MVM_OP_lexoticresult: {
-        MVMint16 src = ins->operands[1].reg.orig;
-        MVMint16 dst = ins->operands[0].reg.orig;
-        | mov TMP1, aword WORK[src];
-        | test TMP1, TMP1;
-        | jz >1;
-        | is_type_object TMP1;
-        | jnz >1;
-        | mov TMP2, aword OBJECT:TMP1->st;
-        | mov TMP2, aword STABLE:TMP2->REPR;
-        | cmp aword REPR:TMP2->ID, MVM_REPR_ID_Lexotic;
-        | jnz >1;
-        | mov TMP2, aword LEXOTIC:TMP1->body.result;
-        | mov WORK[dst], TMP2;
-        | jmp >2;
-        |1:
-        /* throw an exception */
-        | throw_adhoc "lexoticresult needs a Lexotic";
-        /* we never return from an adhoc exception, so no need to deal with that */
-        |2:
         break;
     }
     case MVM_OP_exception: {
@@ -1646,17 +1683,17 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         | mov TMP6, aword TC->cur_frame;
         | mov aword FRAME:TMP6->return_value, ARG1;
         /* tc->cur_frame->return_type = MVM_RETURN_OBJ */
-        | mov dword FRAME:TMP6->return_type, MVM_RETURN_OBJ;
+        | mov byte FRAME:TMP6->return_type, MVM_RETURN_OBJ;
         /* tc->cur_frame->return_address = cur_op */
         | get_cur_op ARG1;
         | mov aword FRAME:TMP6->return_address, ARG1;
-        /* STABLE(code)->invoke(tc, code, capture->body.effective_callsite,
+        /* STABLE(code)->invoke(tc, code, capture->body.apc->effective_callsite,
            capture->body.apc->arg) */
         | mov ARG1, TC;
         | mov ARG3, WORK[capture];
         | mov ARG4, aword CAPTURE:ARG3->body.apc;
+        | mov ARG3, aword ARGCTX:ARG4->callsite;
         | mov ARG4, aword ARGCTX:ARG4->args;
-        | mov ARG3, aword CAPTURE:ARG3->body.effective_callsite;
         | mov FUNCTION, OBJECT:ARG2->st;
         | mov FUNCTION, STABLE:FUNCTION->invoke;
         | call FUNCTION;
@@ -1734,24 +1771,95 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitGraph *jg,
         } else {
             | mov ARG3, 0;
         }
-        | callp &MVM_string_get_grapheme_at;
-        | cmp RV, 0;
-        | jge >1;
-        /* NB - I see no reason why this should be incorrect, but I
-           haven't been able to trigger it yet. */
-        | mov ARG1, TC;
-        | mov ARG2, RV;
-        | callp &MVM_nfg_get_synthetic_info;
-        /* base is only 32 bit wide */
-        | mov RVd, dword NFGSYNTH:RV->base;
-        |1:
+        | callp &MVM_string_ord_at;
         | mov qword WORK[dst], RV;
+        break;
+    }
+    case MVM_OP_setcodeobj: {
+        MVMint16 obj  = ins->operands[0].reg.orig;
+        MVMint16 code = ins->operands[1].reg.orig;
+        | mov TMP1, aword WORK[obj];
+        /* if (REPR(obj)->ID == MVM_REPR_ID_MVMCode) */
+        | mov TMP2, OBJECT:TMP1->st;
+        | mov TMP2, STABLE:TMP2->REPR;
+        | cmp dword REPR:TMP2->ID, MVM_REPR_ID_MVMCode;
+        | je >1;
+        /* else throw */
+        | throw_adhoc "setcodeobj needs a code ref";
+        |1:
+        | mov TMP2, aword WORK[code];
+        | mov aword CODE:TMP1->body.code_object, TMP2;
         break;
     }
     case MVM_OP_lastexpayload: {
         MVMint16 dst = ins->operands[0].reg.orig;
         | mov TMP3, aword TC->last_payload;
         | mov aword WORK[dst], TMP3;
+        break;
+    }
+    case MVM_OP_param_sp: {
+        MVMuint16 dst = ins->operands[0].reg.orig;
+        MVMuint16 off = ins->operands[1].lit_ui16;
+        | mov ARG1, TC
+        | mov ARG2, TC:ARG1->cur_frame
+        | lea ARG2, FRAME:ARG2->params
+        | mov ARG3, off
+        | callp &MVM_args_slurpy_positional;
+        | mov qword WORK[dst], RV;
+        break;
+    }
+    case MVM_OP_param_sn: {
+        MVMuint16 dst = ins->operands[0].reg.orig;
+        | mov ARG1, TC
+        | mov ARG2, TC:ARG1->cur_frame
+        | lea ARG2, FRAME:ARG2->params
+        | callp &MVM_args_slurpy_named;
+        | mov qword WORK[dst], RV;
+        break;
+    }
+    case MVM_OP_sp_cas_o: {
+        MVMint16 target = ins->operands[1].reg.orig;
+        MVMint16 expected = ins->operands[2].reg.orig;
+        MVMint16 value = ins->operands[3].reg.orig;
+        MVMint16 result = ins->operands[0].reg.orig;
+        | mov ARG1, TC;
+        | mov ARG2, aword WORK[target];
+        | mov ARG3, aword WORK[expected];
+        | mov ARG4, aword WORK[value];
+        |.if WIN32;
+        | lea TMP6, WORK[result]
+        | mov qword [rsp+0x20], TMP6
+        |.else;
+        | lea ARG5, WORK[result]
+        |.endif
+        | mov FUNCTION, OBJECT:ARG2->st;
+        | mov FUNCTION, STABLE:FUNCTION->container_spec;
+        | mov FUNCTION, CONTAINERSPEC:FUNCTION->cas;
+        | call FUNCTION;
+        break;
+    }
+    case MVM_OP_sp_atomicload_o: {
+        MVMint16 target = ins->operands[1].reg.orig;
+        MVMint16 result = ins->operands[0].reg.orig;
+        | mov ARG1, TC;
+        | mov ARG2, aword WORK[target];
+        | mov FUNCTION, OBJECT:ARG2->st;
+        | mov FUNCTION, STABLE:FUNCTION->container_spec;
+        | mov FUNCTION, CONTAINERSPEC:FUNCTION->atomic_load;
+        | call FUNCTION;
+        | mov WORK[result], RV
+        break;
+    }
+    case MVM_OP_sp_atomicstore_o: {
+        MVMint16 target = ins->operands[0].reg.orig;
+        MVMint16 value = ins->operands[1].reg.orig;
+        | mov ARG1, TC;
+        | mov ARG2, aword WORK[target];
+        | mov ARG3, aword WORK[value];
+        | mov FUNCTION, OBJECT:ARG2->st;
+        | mov FUNCTION, STABLE:FUNCTION->container_spec;
+        | mov FUNCTION, CONTAINERSPEC:FUNCTION->atomic_store;
+        | call FUNCTION;
         break;
     }
     default:
@@ -2133,8 +2241,19 @@ void MVM_jit_emit_guard(MVMThreadContext *tc, MVMJitGraph *jg,
     /* load object and spesh slot value */
     | mov TMP1, WORK[obj];
     | get_spesh_slot TMP2, spesh_idx;
-    if (op == MVM_OP_sp_guardtype) {
-        /* object in queston should be a type object, so it shouldn't
+    if (op == MVM_OP_sp_guard) {
+        /* object in question should just match the type, so it shouldn't
+         * be zero, and the STABLE should be equal to the value in the spesh
+         * slot */
+        /* check for null */
+        | test TMP1, TMP1;
+        | jz >1;
+        /* get stable and compare */
+        | cmp TMP2, OBJECT:TMP1->st;
+        | jne >1;
+        /* we're good, no need to deopt */
+    } else if (op == MVM_OP_sp_guardtype) {
+        /* object in question should be a type object, so it shouldn't
          * be zero, should not be concrete, and the STABLE should be
          * equal to the value in the spesh slot */
         /* check for null */
@@ -2158,131 +2277,14 @@ void MVM_jit_emit_guard(MVMThreadContext *tc, MVMJitGraph *jg,
         /* should have our stable */
         | cmp TMP2, OBJECT:TMP1->st;
         | jne >1;
-    } else if (op == MVM_OP_sp_guardcontconc) {
-        MVMint16 val_spesh_idx = guard->ins->operands[2].lit_i16;
-        | test TMP1, TMP1;
-        | jz >1;
-        | is_type_object TMP1;
-        | jnz >1;
-        | mov FUNCTION, OBJECT:TMP1->st;
-        | cmp TMP2, FUNCTION;
+    } else if (op == MVM_OP_sp_guardsf) {
+        /* Should be an MVMCode */
+        MVMint32 reprid = MVM_REPR_ID_MVMCode;
+        | mov TMP3, OBJECT:TMP1->st;
+        | mov TMP3, STABLE:TMP3->REPR;
+        | cmp qword REPR:TMP3->ID, reprid;
         | jne >1;
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->fetch;
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | lea ARG3, [rbp-0x28]; // hurray for scratch space
-        | call FUNCTION;
-        | mov TMP3, aword [rbp-0x28];
-        | test TMP3, TMP3;
-        | jz >1;
-        | is_type_object TMP3;
-        | jnz >1;
-        | mov TMP2, OBJECT:TMP3->st;
-        | get_spesh_slot TMP1, val_spesh_idx;
-        | cmp TMP1, TMP2;
-        | jne >1;
-    } else if (op == MVM_OP_sp_guardconttype) {
-        MVMint16 val_spesh_idx = guard->ins->operands[2].lit_i16;
-        | test TMP1, TMP1;
-        | jz >1;
-        | is_type_object TMP1;
-        | jnz >1;
-        | mov FUNCTION, OBJECT:TMP1->st;
-        | cmp TMP2, FUNCTION;
-        | jne >1;
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->fetch;
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | lea ARG3, [rbp-0x28]; // hurray for scratch space
-        | call FUNCTION;
-        | mov TMP3, aword [rbp-0x28];
-        | test TMP3, TMP3;
-        | jz >1;
-        | is_type_object TMP3;
-        // all of this is the same as for guardcontconc, but this time
-        // we want to have a type object instead of a concrete object.
-        | jz >1;
-        | mov TMP2, OBJECT:TMP3->st;
-        | get_spesh_slot TMP1, val_spesh_idx;
-        | cmp TMP1, TMP2;
-        | jne >1;
-    } else if (op == MVM_OP_sp_guardrwconc) {
-        MVMint16 val_spesh_idx  = guard->ins->operands[2].lit_i16;
-        /* if (check && IS_CONCRETE(check) */
-        | test TMP1, TMP1;
-        | jz >1;
-        | is_type_object TMP1;
-        | jnz >1;
-        /* && STABLE(check) == (want_c = cur_frame->effective_spesh_slots[GET_UI16(cur_op,2)] */
-        | mov FUNCTION, OBJECT:TMP1->st;
-        | cmp TMP2, FUNCTION;
-        | jne >1;
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->can_store;
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | call FUNCTION;
-        /* if (constspec->can_store(tc, check) */
-        | test RV, RV;
-        | jz >1;
-        /* restore TMP1 */
-        | mov TMP1, WORK[obj];
-        | mov FUNCTION, OBJECT:TMP1->st; // restore FUNCTION to the st as before
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->fetch;
-        /* constpec->fetch(tc, check, &r) */
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | lea ARG3, [rbp-0x28]; // hurray for scratch space
-        | call FUNCTION;
-        /* if (r.o && IS_CONCRETE(r.o) && STABLE(r.o) == want_v) */
-        | mov TMP3, aword [rbp-0x28];
-        | test TMP3, TMP3;
-        | jz >1;
-        | is_type_object TMP3;
-        | jnz >1;
-        | mov TMP2, OBJECT:TMP3->st;
-        | get_spesh_slot TMP1, val_spesh_idx;
-        | cmp TMP1, TMP2;
-        | jne >1;
-    } else if (op == MVM_OP_sp_guardrwtype) {
-        MVMint16 val_spesh_idx  = guard->ins->operands[2].lit_i16;
-        /* if (check && IS_CONCRETE(check) && STABLE(check) == want_c) */
-        | test TMP1, TMP1;
-        | jz >1;
-        | is_type_object TMP1;
-        | jnz >1;
-        | mov FUNCTION, OBJECT:TMP1->st;
-        | cmp TMP2, FUNCTION;
-        | jne >1;
-        /* if (constpect->can_store(tc, check)) */
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->can_store;
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | call FUNCTION;
-        | test RV, RV;
-        | jz >1;
-        | mov TMP1, WORK[obj];
-        | mov FUNCTION, OBJECT:TMP1->st; // restore FUNCTION to the st as before
-        | mov FUNCTION, STABLE:FUNCTION->container_spec;
-        | mov FUNCTION, CONTAINERSPEC:FUNCTION->fetch;
-        | mov ARG2, TMP1;
-        | mov ARG1, TC;
-        | lea ARG3, [rbp-0x28];
-        /* contspec->fetch(tc, check, &r); */
-        | call FUNCTION;
-        | mov TMP3, aword [rbp-0x28];
-        /* if (r.o && !IS_CONCRETE(r.o) && STABLE(r.o) == want_v) */
-        | test TMP3, TMP3;
-        | jz >1;
-        | is_type_object TMP3;
-        | jz >1;
-        | mov TMP2, OBJECT:TMP3->st;
-        | get_spesh_slot TMP1, val_spesh_idx;
-        | cmp TMP1, TMP2;
+        | cmp TMP2, CODE:TMP1->body.sf;
         | jne >1;
     }
     /* if we're here, we didn't jump to deopt, so skip it */
@@ -2314,8 +2316,8 @@ void MVM_jit_emit_invoke(MVMThreadContext *tc, MVMJitGraph *jg, MVMJitInvoke *in
     | mov FRAME:TMP5->cur_args_callsite, TMP6;
 
     /* Setup the frame for returning to our current position */
-    if (sizeof(MVMReturnType) == 4) {
-        | mov dword FRAME:TMP5->return_type, invoke->return_type;
+    if (sizeof(MVMReturnType) == 1) {
+        | mov byte FRAME:TMP5->return_type, invoke->return_type;
     } else {
         MVM_panic(1, "JIT: MVMReturnType has unexpected size");
     }
@@ -2380,6 +2382,11 @@ void MVM_jit_emit_invoke(MVMThreadContext *tc, MVMJitGraph *jg, MVMJitInvoke *in
         | mov ARG2, WORK[invoke->code_register]; // code object
         | lea ARG3, [rbp-0x30];                  // &cur_callsite
         | mov ARG4, TMP5;                        // args
+        |.if WIN32;
+        | mov qword [rsp+0x20], 0
+        |.else;
+        | mov ARG5, 0;                           // NULL to &was_multi
+        |.endif
         | callp &MVM_frame_find_invokee_multi_ok;
         /* restore callsite, args, RV now holds code object */
         | mov TMP6, [rbp-0x30]; // callsite

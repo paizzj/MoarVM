@@ -56,8 +56,7 @@ MVMuint32 MVM_string_ascii_decodestream(MVMThreadContext *tc, MVMDecodeStream *d
     if (stopper_chars && *stopper_chars == 0)
         return 1;
 
-    /* Take length of head buffer as initial guess. */
-    bufsize = ds->bytes_head->length;
+    bufsize = ds->result_size_guess;
     buffer = MVM_malloc(bufsize * sizeof(MVMGrapheme32));
 
     /* Decode each of the buffers. */
@@ -67,7 +66,7 @@ MVMuint32 MVM_string_ascii_decodestream(MVMThreadContext *tc, MVMDecodeStream *d
     while (cur_bytes) {
         /* Process this buffer. */
         MVMint32  pos   = cur_bytes == ds->bytes_head ? ds->bytes_head_pos : 0;
-        char     *bytes = cur_bytes->bytes;
+        MVMuint8 *bytes = cur_bytes->bytes;
         while (pos < cur_bytes->length) {
             MVMCodepoint codepoint = bytes[pos++];
             MVMGrapheme32 graph;
@@ -76,7 +75,7 @@ MVMuint32 MVM_string_ascii_decodestream(MVMThreadContext *tc, MVMDecodeStream *d
                     "Will not decode invalid ASCII (code point > 127 found)");
             if (last_was_cr) {
                 if (codepoint == '\n') {
-                    graph = MVM_nfg_crlf_grapheme(tc);
+                    graph = MVM_unicode_normalizer_translated_crlf(tc, &(ds->norm));
                 }
                 else {
                     graph = '\r';
@@ -102,11 +101,11 @@ MVMuint32 MVM_string_ascii_decodestream(MVMThreadContext *tc, MVMDecodeStream *d
             last_accept_bytes = cur_bytes;
             last_accept_pos = pos;
             total++;
-            if (stopper_chars && *stopper_chars == total) {
+            if (MVM_string_decode_stream_maybe_sep(tc, seps, codepoint)) {
                 reached_stopper = 1;
                 goto done;
             }
-            if (MVM_string_decode_stream_maybe_sep(tc, seps, codepoint)) {
+            else if (stopper_chars && *stopper_chars == total) {
                 reached_stopper = 1;
                 goto done;
             }
@@ -135,9 +134,8 @@ MVMuint32 MVM_string_ascii_decodestream(MVMThreadContext *tc, MVMDecodeStream *d
 char * MVM_string_ascii_encode_substr(MVMThreadContext *tc, MVMString *str, MVMuint64 *output_size, MVMint64 start, MVMint64 length, MVMString *replacement, MVMint32 translate_newlines) {
     /* ASCII is a single byte encoding, but \r\n is a 2-byte grapheme, so we
      * may have to resize as we go. */
-    MVMuint32      startu    = (MVMuint32)start;
     MVMStringIndex strgraphs = MVM_string_graphs(tc, str);
-    MVMuint32      lengthu   = (MVMuint32)(length == -1 ? strgraphs - startu : length);
+    MVMuint32      lengthu   = (MVMuint32)(length == -1 ? strgraphs - (MVMuint32)start : length);
     MVMuint8      *result;
     size_t         result_alloc;
     MVMuint8      *repl_bytes = NULL;

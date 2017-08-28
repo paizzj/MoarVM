@@ -33,15 +33,16 @@ my @args = @ARGV;
 
 GetOptions(\%args, qw(
     help|?
-    debug:s optimize:s instrument!
+    debug:s optimize:s instrument! coverage
     os=s shell=s toolchain=s compiler=s
     ar=s cc=s ld=s make=s has-sha has-libuv
     static has-libtommath has-libatomic_ops
     has-dyncall has-libffi pkgconfig=s
     build=s host=s big-endian jit! enable-jit lua=s has-dynasm
-    prefix=s bindir=s libdir=s mastdir=s make-install asan ubsan valgrind),
+    prefix=s bindir=s libdir=s mastdir=s make-install asan ubsan valgrind telemeh),
     'no-optimize|nooptimize' => sub { $args{optimize} = 0 },
-    'no-debug|nodebug' => sub { $args{debug} = 0 }
+    'no-debug|nodebug' => sub { $args{debug} = 0 },
+    'no-telemeh|notelemeh' => sub { $args{telemeh} = 0 }
 ) or die "See --help for further information\n";
 
 
@@ -76,7 +77,7 @@ if (-d '.git') {
 $args{optimize}     = 3 if not defined $args{optimize} or $args{optimize} eq "";
 $args{debug}        = 3 if defined $args{debug} and $args{debug} eq "";
 
-for (qw(instrument static big-endian has-libtommath has-sha has-libuv
+for (qw(coverage instrument static big-endian has-libtommath has-sha has-libuv
         has-libatomic_ops has-dynasm asan ubsan valgrind)) {
     $args{$_} = 0 unless defined $args{$_};
 }
@@ -116,7 +117,7 @@ if (open(my $fh, '<', 'VERSION')) {
     close($fh);
 }
 # .git is a file and not a directory in submodule
-if (-e '.git' && open(my $GIT, '-|', "git describe --tags")) {
+if (-e '.git' && open(my $GIT, '-|', "git describe")) {
     $VERSION = <$GIT>;
     close($GIT);
 }
@@ -333,13 +334,16 @@ push @cflags, $config{ccmiscflags};
 push @cflags, $config{ccoptiflags}  if $args{optimize};
 push @cflags, $config{ccdebugflags} if $args{debug};
 push @cflags, $config{ccinstflags}  if $args{instrument};
+push @cflags, $config{ld_covflags}  if $args{coverage};
 push @cflags, $config{ccwarnflags};
 push @cflags, $config{ccdefflags};
 push @cflags, $config{ccshared}     unless $args{static};
 push @cflags, '-fno-omit-frame-pointer' if $args{asan} or $args{ubsan};
 push @cflags, '-fsanitize=address' if $args{asan};
 push @cflags, '-fsanitize=undefined' if $args{ubsan};
+push @cflags, '-DDEBUG_HELPERS' if $args{debug};
 push @cflags, '-DMVM_VALGRIND_SUPPORT' if $args{valgrind};
+push @cflags, '-DHAVE_TELEMEH' if $args{telemeh};
 push @cflags, '-DWORDS_BIGENDIAN' if $config{be}; # 3rdparty/sha1 needs it and it isnt set on mips;
 push @cflags, $ENV{CFLAGS} if $ENV{CFLAGS};
 push @cflags, $ENV{CPPFLAGS} if $ENV{CPPFLAGS};
@@ -350,7 +354,8 @@ my @ldflags = ($config{ldmiscflags});
 push @ldflags, $config{ldoptiflags}  if $args{optimize};
 push @ldflags, $config{lddebugflags} if $args{debug};
 push @ldflags, $config{ldinstflags}       if $args{instrument};
-push @ldflags, $config{ldrpath}           unless $args{static};
+push @ldflags, $config{ld_covflags}  if $args{coverage};
+push @ldflags, $config{ldrpath}           if not $args{static} and $config{prefix} ne '/usr';
 push @ldflags, $^O eq 'darwin' ? '-faddress-sanitizer' : '-fsanitize=address' if $args{asan};
 push @ldflags, $ENV{LDFLAGS}  if $ENV{LDFLAGS};
 $config{ldflags} = join ' ', @ldflags;
@@ -423,6 +428,7 @@ if ($config{cc} eq 'cl') {
 build::probe::C_type_bool(\%config, \%defaults);
 build::probe::computed_goto(\%config, \%defaults);
 build::probe::pthread_yield(\%config, \%defaults);
+build::probe::rdtscp(\%config, \%defaults);
 
 my $order = $config{be} ? 'big endian' : 'little endian';
 
@@ -511,6 +517,12 @@ write_backend_config();
 print "\n", <<TERM, "\n";
   3rdparty: $thirdpartylibs
 TERM
+
+# make sure to link with the correct entry point */
+$config{mingw_unicode} = '';
+if ($config{os} eq 'mingw32') {
+    $config{mingw_unicode} = '-municode';
+}
 
 # read list of files to generate
 
@@ -791,12 +803,19 @@ __END__
                    [--has-libtommath] [--has-sha] [--has-libuv]
                    [--has-libatomic_ops] [--has-dynasm]
                    [--lua <lua>] [--asan] [--ubsan] [--no-jit]
+                   [--telemeh]
 
     ./Configure.pl --build <build-triple> --host <host-triple>
                    [--ar <ar>] [--cc <cc>] [--ld <ld>] [--make <make>]
                    [--debug] [--optimize] [--instrument]
                    [--static] [--big-endian] [--prefix]
                    [--lua <lua>] [--make-install]
+
+=head2 Use of environment variables
+
+Compiler and linker flags can be extended with environment variables.
+
+CFLAGS="..." LDFLAGS="..." ./Configure.pl
 
 =head1 OPTIONS
 
@@ -834,8 +853,7 @@ turns on Address Sanitizer when compiling with C<clang>.  Defaults to off.
 Set the operating system name which you are compiling to.
 
 Currently supported operating systems are C<posix>, C<linux>, C<darwin>,
-C<openbsd>, C<netbsd>, C<freebsd>, C<solaris>, C<win32>, C<cygwin> and
-C<mingw32>.
+C<openbsd>, C<netbsd>, C<freebsd>, C<solaris>, C<win32>, and C<mingw32>.
 
 If not explicitly set, the option will be provided by the Perl runtime.
 In case of unknown operating systems, a POSIX userland is assumed.
@@ -955,5 +973,9 @@ Disable JIT compiler, which is enabled by default to JIT-compile hot frames.
 =item --lua=path/to/lua/executable
 
 Path to a lua executable. (Used during the build when JIT is enabled).
+
+=item --telemeh
+
+Build support for the fine-grained internal event logger.
 
 =back

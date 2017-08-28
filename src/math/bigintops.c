@@ -5,6 +5,20 @@
     #define MAX(x,y) ((x)>(y)?(x):(y))
 #endif
 
+#ifndef MIN
+    #define MIN(x,y) ((x)<(y)?(x):(y))
+#endif
+
+MVM_STATIC_INLINE void adjust_nursery(MVMThreadContext *tc, MVMP6bigintBody *body) {
+    if (MVM_BIGINT_IS_BIG(body)) {
+        int used = USED(body->u.bigint);
+        int adjustment = MIN(used, 32768) & ~0x7;
+        if (adjustment && (char *)tc->nursery_alloc_limit - adjustment > (char *)tc->nursery_alloc) {
+            tc->nursery_alloc_limit = (char *)(tc->nursery_alloc_limit) - adjustment;
+        }
+    }
+}
+
 /* Taken from mp_set_long, but portably accepts a 64-bit number. */
 int MVM_bigint_mp_set_uint64(mp_int * a, MVMuint64 b) {
   int     x, res;
@@ -194,7 +208,7 @@ static void store_bigint_result(MVMP6bigintBody *body, mp_int *i) {
     }
 }
 
-/* Bitops on libtomath (no 2s compliment API) are horrendously inefficient and
+/* Bitops on libtomath (no two's complement API) are horrendously inefficient and
  * really should be hand-coded to work DIGIT-by-DIGIT with in-loop carry
  * handling.  For now we have these fixups.
  *
@@ -246,7 +260,7 @@ static void two_complement_bitop(mp_int *a, mp_int *b, mp_int *c,
         g = &e;
     }
     /* f and g now guaranteed to each point to positive bigints containing
-     * a 2s compliment representation of the values in a and b.  If either
+     * a two's complement representation of the values in a and b.  If either
      * a or b was negative, the representation is one tomath "digit" longer
      * than it need be and sign extended.
      */
@@ -301,6 +315,7 @@ void MVM_bigint_##opname(MVMThreadContext *tc, MVMObject *result, MVMObject *sou
             mp_init(ib); \
             mp_##opname(ia, ib); \
             store_bigint_result(bb, ib); \
+            adjust_nursery(tc, bb); \
         } \
         else { \
             MVMint64 sb; \
@@ -332,6 +347,7 @@ MVMObject * MVM_bigint_##opname(MVMThreadContext *tc, MVMObject *result_type, MV
     mp_##opname(ia, ib, ic); \
     store_bigint_result(bc, ic); \
     clear_temp_bigints(tmp, 2); \
+    adjust_nursery(tc, bc); \
     return result; \
 }
 
@@ -359,6 +375,7 @@ MVMObject * MVM_bigint_##opname(MVMThreadContext *tc, MVMObject *result_type, MV
         mp_##opname(ia, ib, ic); \
         store_bigint_result(bc, ic); \
         clear_temp_bigints(tmp, 2); \
+        adjust_nursery(tc, bc); \
     } \
     else { \
         MVMint64 sc; \
@@ -396,6 +413,7 @@ MVMObject * MVM_bigint_##opname(MVMThreadContext *tc, MVMObject *result_type, MV
         two_complement_bitop(ia, ib, ic, mp_##opname); \
         store_bigint_result(bc, ic); \
         clear_temp_bigints(tmp, 2); \
+        adjust_nursery(tc, bc); \
     } \
     else { \
         MVMint64 sc; \
@@ -441,6 +459,7 @@ MVMObject *MVM_bigint_gcd(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         mp_gcd(ia, ib, ic);
         store_bigint_result(bc, ic);
         clear_temp_bigints(tmp, 2);
+        adjust_nursery(tc, bc);
     } else {
         MVMint32 sa = ba->u.smallint.value;
         MVMint32 sb = bb->u.smallint.value;
@@ -495,9 +514,9 @@ MVMObject * MVM_bigint_mod(MVMThreadContext *tc, MVMObject *result_type, MVMObje
 
     bc = get_bigint_body(tc, result);
 
-    // XXX the behavior of C's mod operator is not correct
-    // for our purposes. So we rely on mp_mod for all our modulus
-    // calculations for now.
+    /* XXX the behavior of C's mod operator is not correct
+     * for our purposes. So we rely on mp_mod for all our modulus
+     * calculations for now. */
     if (1 || MVM_BIGINT_IS_BIG(ba) || MVM_BIGINT_IS_BIG(bb)) {
         mp_int *tmp[2] = { NULL, NULL };
         mp_int *ia = force_bigint(ba, tmp);
@@ -514,6 +533,7 @@ MVMObject * MVM_bigint_mod(MVMThreadContext *tc, MVMObject *result_type, MVMObje
             MVM_exception_throw_adhoc(tc, "Division by zero");
         }
         store_bigint_result(bc, ic);
+        adjust_nursery(tc, bc);
     } else {
         store_int64_result(bc, ba->u.smallint.value % bb->u.smallint.value);
     }
@@ -542,7 +562,7 @@ MVMObject *MVM_bigint_div(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
 
     bc = get_bigint_body(tc, result);
 
-    // we only care about MP_LT or !MP_LT, so we give MP_GT even for 0.
+    /* we only care about MP_LT or !MP_LT, so we give MP_GT even for 0. */
     if (MVM_BIGINT_IS_BIG(ba)) {
         cmp_a = !mp_iszero(ba->u.bigint) && SIGN(ba->u.bigint) == MP_NEG ? MP_LT : MP_GT;
     } else {
@@ -562,9 +582,9 @@ MVMObject *MVM_bigint_div(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         ic = MVM_malloc(sizeof(mp_int));
         mp_init(ic);
 
-        // if we do a div with a negative, we need to make sure
-        // the result is floored rather than rounded towards
-        // zero, like C and libtommath would do.
+        /* if we do a div with a negative, we need to make sure
+         * the result is floored rather than rounded towards
+         * zero, like C and libtommath would do. */
         if ((cmp_a == MP_LT) ^ (cmp_b == MP_LT)) {
             mp_init(&remainder);
             mp_init(&intermediate);
@@ -591,6 +611,7 @@ MVMObject *MVM_bigint_div(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         }
         store_bigint_result(bc, ic);
         clear_temp_bigints(tmp, 2);
+        adjust_nursery(tc, bc);
     } else {
         MVMint32 num   = ba->u.smallint.value;
         MVMint32 denom = bb->u.smallint.value;
@@ -649,10 +670,13 @@ MVMObject * MVM_bigint_pow(MVMThreadContext *tc, MVMObject *a, MVMObject *b,
         }
         else {
             mp_int *ic = MVM_malloc(sizeof(mp_int));
+            MVMP6bigintBody *resbody;
             mp_init(ic);
             mp_expt_d(base, exponent_d, ic);
             r = MVM_repr_alloc_init(tc, int_type);
-            store_bigint_result(get_bigint_body(tc, r), ic);
+            resbody = get_bigint_body(tc, r);
+            store_bigint_result(resbody, ic);
+            adjust_nursery(tc, resbody);
         }
     }
     else {
@@ -683,6 +707,7 @@ MVMObject *MVM_bigint_shl(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         two_complement_shl(ib, ia, n);
         store_bigint_result(bb, ib);
         clear_temp_bigints(tmp, 1);
+        adjust_nursery(tc, bb);
     } else {
         MVMint64 value;
         if (n < 0)
@@ -694,7 +719,17 @@ MVMObject *MVM_bigint_shl(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
 
     return result;
 }
-
+/* Checks if a MVMP6bigintBody is negative. Handles cases where it is stored as
+ * a small int as well as cases when it is stored as a bigint */
+int BIGINT_IS_NEGATIVE (MVMP6bigintBody *ba) {
+    mp_int *mp_a = ba->u.bigint;
+    if MVM_BIGINT_IS_BIG(ba) {
+        return SIGN(mp_a) == MP_NEG;
+    }
+    else {
+        return ba->u.smallint.value < 0;
+    }
+}
 MVMObject *MVM_bigint_shr(MVMThreadContext *tc, MVMObject *result_type, MVMObject *a, MVMint64 n) {
     MVMP6bigintBody *ba = get_bigint_body(tc, a);
     MVMP6bigintBody *bb;
@@ -714,8 +749,9 @@ MVMObject *MVM_bigint_shr(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         two_complement_shl(ib, ia, -n);
         store_bigint_result(bb, ib);
         clear_temp_bigints(tmp, 1);
+        adjust_nursery(tc, bb);
     } else if (n >= 32) {
-        store_int64_result(bb, 0);
+        store_int64_result(bb, BIGINT_IS_NEGATIVE(ba) ? -1 : 0);
     } else {
         MVMint32 value = ba->u.smallint.value;
         value = value >> n;
@@ -744,6 +780,7 @@ MVMObject *MVM_bigint_not(MVMThreadContext *tc, MVMObject *result_type, MVMObjec
         mp_add_d(ia, 1, ib);
         mp_neg(ib, ib);
         store_bigint_result(bb, ib);
+        adjust_nursery(tc, bb);
     } else {
         MVMint32 value = ba->u.smallint.value;
         value = ~value;
@@ -770,6 +807,7 @@ void MVM_bigint_expmod(MVMThreadContext *tc, MVMObject *result, MVMObject *a, MV
     mp_exptmod(ia, ib, ic, id);
     store_bigint_result(bd, id);
     clear_temp_bigints(tmp, 3);
+    adjust_nursery(tc, bd);
 }
 
 void MVM_bigint_from_str(MVMThreadContext *tc, MVMObject *a, const char *buf) {
@@ -777,6 +815,7 @@ void MVM_bigint_from_str(MVMThreadContext *tc, MVMObject *a, const char *buf) {
     mp_int *i = MVM_malloc(sizeof(mp_int));
     mp_init(i);
     mp_read_radix(i, buf, 10);
+    adjust_nursery(tc, body);
     if (can_be_smallint(i)) {
         body->u.smallint.flag = MVM_BIGINT_32_FLAG;
         body->u.smallint.value = SIGN(i) == MP_NEG ? -DIGIT(i, 0) : DIGIT(i, 0);
@@ -887,29 +926,69 @@ MVMnum64 MVM_bigint_div_num(MVMThreadContext *tc, MVMObject *a, MVMObject *b) {
     return c;
 }
 
-void MVM_bigint_rand(MVMThreadContext *tc, MVMObject *a, MVMObject *b) {
-    MVMP6bigintBody *ba = get_bigint_body(tc, a);
+MVMObject * MVM_bigint_rand(MVMThreadContext *tc, MVMObject *type, MVMObject *b) {
+    MVMObject *result;
+    MVMP6bigintBody *ba;
     MVMP6bigintBody *bb = get_bigint_body(tc, b);
 
-    mp_int *tmp[1] = { NULL };
-    mp_int *rnd = MVM_malloc(sizeof(mp_int));
-    mp_int *max = force_bigint(bb, tmp);
+    MVMint8 use_small_arithmetic = 0;
+    MVMint8 have_to_negate = 0;
+    MVMint32 smallint_max = 0;
 
-    /* Workaround tommath issue #56 */
-    mp_int workaround;
-    mp_init (&workaround);
-    mp_rand(&workaround, USED(max) + 1);
-    mp_mul_2d(&workaround, 29, &workaround);
+    if (MVM_BIGINT_IS_BIG(bb)) {
+        if (can_be_smallint(bb->u.bigint)) {
+            use_small_arithmetic = 1;
+            smallint_max = DIGIT(bb->u.bigint, 0);
+            have_to_negate = SIGN(bb->u.bigint) == MP_NEG;
+        }
+    } else {
+        use_small_arithmetic = 1;
+        smallint_max = bb->u.smallint.value;
+    }
 
-    mp_init(rnd);
-    mp_rand(rnd, USED(max) + 1);
+    if (use_small_arithmetic) {
+        if (MP_GEN_RANDOM_MAX >= abs(smallint_max)) {
+            mp_digit result_int = MP_GEN_RANDOM();
+            result_int = result_int % smallint_max;
+            if(have_to_negate)
+                result_int *= -1;
 
-    mp_xor(rnd, &workaround, rnd);
-    mp_clear(&workaround);
+            MVMROOT(tc, type, {
+                MVMROOT(tc, b, {
+                    result = MVM_repr_alloc_init(tc, type);
+                });
+            });
 
-    mp_mod(rnd, max, rnd);
-    store_bigint_result(ba, rnd);
-    clear_temp_bigints(tmp, 1);
+            ba = get_bigint_body(tc, result);
+            store_int64_result(ba, result_int);
+        } else {
+            use_small_arithmetic = 0;
+        }
+    }
+
+    if (!use_small_arithmetic) {
+        mp_int *tmp[1] = { NULL };
+        mp_int *rnd = MVM_malloc(sizeof(mp_int));
+        mp_int *max = force_bigint(bb, tmp);
+
+        MVMROOT(tc, type, {
+            MVMROOT(tc, b, {
+                result = MVM_repr_alloc_init(tc, type);
+            });
+        });
+
+        ba = get_bigint_body(tc, result);
+
+        mp_init(rnd);
+        mp_rand(rnd, USED(max) + 1);
+
+        mp_mod(rnd, max, rnd);
+        store_bigint_result(ba, rnd);
+        clear_temp_bigints(tmp, 1);
+        adjust_nursery(tc, ba);
+    }
+
+    return result;
 }
 
 MVMint64 MVM_bigint_is_prime(MVMThreadContext *tc, MVMObject *a, MVMint64 b) {
@@ -932,8 +1011,8 @@ MVMint64 MVM_bigint_is_prime(MVMThreadContext *tc, MVMObject *a, MVMint64 b) {
             return result;
         }
     } else {
-        // we only reach this if we have a smallint that's equal to 1.
-        // which we define as not-prime.
+        /* we only reach this if we have a smallint that's equal to 1.
+         * which we define as not-prime. */
         return 0;
     }
 }
@@ -1009,16 +1088,15 @@ MVMObject * MVM_bigint_radix(MVMThreadContext *tc, MVMint64 radix, MVMString *st
         else if (ch >= 0xFF41 && ch <= 0xFF5A) ch = ch - 0xFF41 + 10; /* lowercase fullwidth */
         else if (ch > 0 && MVM_unicode_codepoint_get_property_int(tc, ch, MVM_UNICODE_PROPERTY_NUMERIC_TYPE)
          == MVM_UNICODE_PVALUE_Numeric_Type_DECIMAL) {
-            /* as of Unicode 6.0.0, characters with the 'de' Numeric Type (and are
+            /* as of Unicode 9.0.0, characters with the 'de' Numeric Type (and are
              * thus also of General Category Nd, since 4.0.0) are contiguous
              * sequences of 10 chars whose Numeric Values ascend from 0 through 9.
              */
 
-            /* the string returned for NUMERIC_VALUE contains a floating point
-             * value, so atoi will stop on the . in the string. This is fine
-             * though, since we'd have to truncate the float regardless.
-             */
-            ch = atoi(MVM_unicode_codepoint_get_property_cstr(tc, ch, MVM_UNICODE_PROPERTY_NUMERIC_VALUE));
+            /* the string returned for NUMERIC_VALUE_NUMERATOR contains an integer
+             * value. We can use numerator because they all are from 0-9 and have
+             * denominator of 1 */
+            ch = fast_atoi(MVM_unicode_codepoint_get_property_cstr(tc, ch, MVM_UNICODE_PROPERTY_NUMERIC_VALUE_NUMERATOR));
         }
         else break;
         if (ch >= radix) break;
@@ -1045,6 +1123,9 @@ MVMObject * MVM_bigint_radix(MVMThreadContext *tc, MVMint64 radix, MVMString *st
     store_bigint_result(bvalue, value);
     store_bigint_result(bbase, base);
 
+    adjust_nursery(tc, bvalue);
+    adjust_nursery(tc, bbase);
+
     pos_obj = MVM_repr_box_int(tc, type, pos);
     MVM_repr_push_o(tc, result, pos_obj);
 
@@ -1066,7 +1147,7 @@ MVMint64 MVM_bigint_is_big(MVMThreadContext *tc, MVMObject *a) {
             is_big = 1;
         return is_big;
     } else {
-        // if it's in a smallint, it's 32 bits big at most and fits into an INTVAL easily.
+        /* if it's in a smallint, it's 32 bits big at most and fits into an INTVAL easily. */
         return 0;
     }
 }

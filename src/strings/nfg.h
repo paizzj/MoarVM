@@ -19,6 +19,9 @@ struct MVMNFGState {
 
     /* Number of synthetics we have. */
     MVMint32 num_synthetics;
+
+    /* Cached CRLF grapheme index, since we need it so often. */
+    MVMGrapheme32 crlf_grapheme;
 };
 
 /* State held about a synthetic. */
@@ -71,6 +74,11 @@ struct MVMNFGTrieNodeEntry {
     MVMNFGTrieNode *node;
 };
 
+/* The maximum number of codepoints we will allow in a synthetic grapheme.
+ * This is a good bit higher than any real-world use case is going to run
+ * in to. */
+#define MVM_GRAPHEME_MAX_CODEPOINTS 1024
+
 /* Functions related to grapheme handling. */
 MVMGrapheme32 MVM_nfg_codes_to_grapheme(MVMThreadContext *tc, MVMCodepoint *codes, MVMint32 num_codes);
 MVMGrapheme32 MVM_nfg_codes_to_grapheme_utf8_c8(MVMThreadContext *tc, MVMCodepoint *codes, MVMint32 num_codes);
@@ -79,5 +87,6 @@ MVMNFGSynthetic * MVM_nfg_get_synthetic_info(MVMThreadContext *tc, MVMGrapheme32
 MVMuint32 MVM_nfg_get_case_change(MVMThreadContext *tc, MVMGrapheme32 codepoint, MVMint32 case_, MVMGrapheme32 **result);
 MVMint32 MVM_nfg_is_concat_stable(MVMThreadContext *tc, MVMString *a, MVMString *b);
 
-/* NFG subsystem cleanup. */
+/* NFG subsystem initialization and cleanup. */
+void MVM_nfg_init(MVMThreadContext *tc);
 void MVM_nfg_destroy(MVMThreadContext *tc);

@@ -279,7 +279,7 @@ static void process_gc_worklist(MVMThreadContext *tc, MVMHeapSnapshotState *ss, 
     MVMuint16 ref_index = desc
         ? get_string_index(tc, ss, desc, STR_MODE_CONST)
         : 0;
-    while (c_ptr = MVM_gc_worklist_get(tc, ss->gcwl)) {
+    while (( c_ptr = MVM_gc_worklist_get(tc, ss->gcwl) )) {
         MVMCollectable *c = *c_ptr;
         if (c)
             add_reference(tc, ss, ref_kind, ref_index,
@@ -312,7 +312,7 @@ static void process_workitems(MVMThreadContext *tc, MVMHeapSnapshotState *ss) {
         MVMHeapSnapshotWorkItem item = pop_workitem(tc, ss);
 
         /* We take our own working copy of the collectable info, since the
-         * collectables array can grow and be reallocated. */ 
+         * collectables array can grow and be reallocated. */
         MVMHeapSnapshotCollectable col;
         set_ref_from(tc, ss, item.col_idx);
         col = ss->hs->collectables[item.col_idx];
@@ -424,7 +424,7 @@ static void process_workitems(MVMThreadContext *tc, MVMHeapSnapshotState *ss) {
                     MVMuint16 *type_map;
                     MVMuint16  name_count = frame->static_info->body.num_lexicals;
                     MVMLexicalRegistry **names = frame->static_info->body.lexical_names_list;
-                    if (frame->spesh_cand && frame->spesh_log_idx == -1 && frame->spesh_cand->lexical_types) {
+                    if (frame->spesh_cand && frame->spesh_cand->lexical_types) {
                         type_map = frame->spesh_cand->lexical_types;
                         count    = frame->spesh_cand->num_lexicals;
                     }
@@ -449,23 +449,25 @@ static void process_workitems(MVMThreadContext *tc, MVMHeapSnapshotState *ss) {
                     (MVMCollectable *)frame->code_ref, "Code reference");
                 MVM_profile_heap_add_collectable_rel_const_cstr(tc, ss,
                     (MVMCollectable *)frame->static_info, "Static frame");
-                MVM_profile_heap_add_collectable_rel_const_cstr(tc, ss,
-                    (MVMCollectable *)frame->dynlex_cache_name,
-                    "Dynamic lexical cache name");
 
-                if (frame->special_return_data && frame->mark_special_return_data) {
-                    frame->mark_special_return_data(tc, frame, ss->gcwl);
-                    process_gc_worklist(tc, ss, "Special return data");
-                }
-
-                if (frame->continuation_tags) {
-                    MVMContinuationTag *tag = frame->continuation_tags;
-                    while (tag) {
-                        MVM_profile_heap_add_collectable_rel_const_cstr(tc, ss,
-                            (MVMCollectable *)tag->tag, "Continuation tag");
-                        col.unmanaged_size += sizeof(MVMContinuationTag);
-                        tag = tag->next;
+                if (frame->extra) {
+                    MVMFrameExtra *e = frame->extra;
+                    if (e->special_return_data && e->mark_special_return_data) {
+                        e->mark_special_return_data(tc, frame, ss->gcwl);
+                        process_gc_worklist(tc, ss, "Special return data");
                     }
+                    if (e->continuation_tags) {
+                        MVMContinuationTag *tag = e->continuation_tags;
+                        while (tag) {
+                            MVM_profile_heap_add_collectable_rel_const_cstr(tc, ss,
+                                (MVMCollectable *)tag->tag, "Continuation tag");
+                            col.unmanaged_size += sizeof(MVMContinuationTag);
+                            tag = tag->next;
+                        }
+                    }
+                    MVM_profile_heap_add_collectable_rel_const_cstr(tc, ss,
+                        (MVMCollectable *)e->dynlex_cache_name,
+                        "Dynamic lexical cache name");
                 }
 
                 break;
@@ -767,7 +769,7 @@ MVMObject * references_str(MVMThreadContext *tc, MVMHeapSnapshot *s) {
     MVMuint64 i;
     for (i = 0; i < s->num_references; i++) {
         char tmp[128];
-        int item_chars = snprintf(tmp, 128, "%lu,%lu,%lu;",
+        int item_chars = snprintf(tmp, 128, "%"PRIu64",%"PRIu64",%"PRIu64";",
             s->references[i].description & ((1 << MVM_SNAPSHOT_REF_KIND_BITS) - 1),
             s->references[i].description >> MVM_SNAPSHOT_REF_KIND_BITS,
             s->references[i].collectable_index);

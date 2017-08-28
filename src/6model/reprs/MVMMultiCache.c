@@ -1,12 +1,12 @@
 #include "moar.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
+static const MVMREPROps MVMMultiCache_this_repr;
 
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st = MVM_gc_allocate_stable(tc, &MVMMultiCache_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
@@ -69,10 +69,10 @@ static MVMuint64 unmanaged_size(MVMThreadContext *tc, MVMSTable *st, void *data)
 
 /* Initializes the representation. */
 const MVMREPROps * MVMMultiCache_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &MVMMultiCache_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps MVMMultiCache_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     NULL, /* initialize */
@@ -155,7 +155,6 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
     size_t             new_size;
     MVMMultiCacheNode *new_head;
     MVMObject        **new_results;
-    int                unlock_necessary = 0;
 
     /* Allocate a cache if needed. */
     if (MVM_is_null(tc, cache_obj) || !IS_CONCRETE(cache_obj) || REPR(cache_obj)->ID != MVM_REPR_ID_MVMMultiCache) {
@@ -169,8 +168,8 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
 
     /* Ensure we got a capture in to cache on; bail if not interned. */
     if (REPR(capture)->ID == MVM_REPR_ID_MVMCallCapture) {
-        cs         = ((MVMCallCapture *)capture)->body.effective_callsite;
         apc        = ((MVMCallCapture *)capture)->body.apc;
+        cs         = apc->callsite;
         if (!cs->is_interned)
             return cache_obj;
     }
@@ -190,7 +189,7 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
             if (st->container_spec && IS_CONCRETE(arg.o)) {
                 MVMContainerSpec const *contspec = st->container_spec;
                 if (!contspec->fetch_never_invokes)
-                    goto DONE; /* Impossible to cache. */
+                    return cache_obj; /* Impossible to cache. */
                 if (REPR(arg.o)->ID != MVM_REPR_ID_NativeRef) {
                     is_rw = contspec->can_store(tc, arg.o);
                     contspec->fetch(tc, arg.o, &arg);
@@ -207,15 +206,11 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
         }
     }
 
-    /* If we're in a multi-threaded context, obtain the cache additions
-     * lock, and then do another lookup to ensure nobody beat us to
-     * making this entry. */
-    if (MVM_instance_have_user_threads(tc)) {
-        uv_mutex_lock(&(tc->instance->mutex_multi_cache_add));
-        unlock_necessary = 1;
-        if (MVM_multi_cache_find(tc, cache_obj, capture))
-            goto DONE;
-    }
+    /* Oobtain the cache addition lock, and then do another lookup to ensure
+     * nobody beat us to making this entry. */
+    uv_mutex_lock(&(tc->instance->mutex_multi_cache_add));
+    if (MVM_multi_cache_find(tc, cache_obj, capture))
+        goto DONE;
 
     /* We're now udner the insertion lock and know nobody else can tweak the
      * cache. First, see if there's even a current version and search tree. */
@@ -363,10 +358,9 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
     }
 #endif
 
-    /* Release lock if needed. */
+    /* Release lock. */
   DONE:
-    if (unlock_necessary)
-        uv_mutex_unlock(&(tc->instance->mutex_multi_cache_add));
+    uv_mutex_unlock(&(tc->instance->mutex_multi_cache_add));
 
     /* Hand back the created/updated cache. */
     return cache_obj;
@@ -375,8 +369,8 @@ MVMObject * MVM_multi_cache_add(MVMThreadContext *tc, MVMObject *cache_obj, MVMO
 /* Does a lookup in a multi-dispatch cache using a capture. */
 MVMObject * MVM_multi_cache_find(MVMThreadContext *tc, MVMObject *cache_obj, MVMObject *capture) {
     if (REPR(capture)->ID == MVM_REPR_ID_MVMCallCapture) {
-        MVMCallsite       *cs  = ((MVMCallCapture *)capture)->body.effective_callsite;
         MVMArgProcContext *apc = ((MVMCallCapture *)capture)->body.apc;
+        MVMCallsite       *cs  = apc->callsite;
         return MVM_multi_cache_find_callsite_args(tc, cache_obj, cs, apc->args);
     }
     else {
@@ -454,7 +448,9 @@ MVMObject * MVM_multi_cache_find_callsite_args(MVMThreadContext *tc, MVMObject *
 }
 
 /* Do a multi cache lookup based upon spesh arg facts. */
-MVMObject * MVM_multi_cache_find_spesh(MVMThreadContext *tc, MVMObject *cache_obj, MVMSpeshCallInfo *arg_info) {
+MVMObject * MVM_multi_cache_find_spesh(MVMThreadContext *tc, MVMObject *cache_obj,
+                                       MVMSpeshCallInfo *arg_info,
+                                       MVMSpeshStatsType *type_tuple) {
     MVMMultiCacheBody *cache;
     MVMMultiCacheNode *tree;
     MVMint32 cur_node;
@@ -488,8 +484,39 @@ MVMObject * MVM_multi_cache_find_spesh(MVMThreadContext *tc, MVMObject *cache_ob
         MVMuint64      arg_match = tree[cur_node].action.arg_match;
         MVMuint64      arg_idx   = arg_match & MVM_MULTICACHE_ARG_IDX_FILTER;
         MVMuint64      type_id   = arg_match & MVM_MULTICACHE_TYPE_ID_FILTER;
-        MVMSpeshFacts *facts     = arg_info->arg_facts[arg_idx];
-        if (facts) {
+        MVMSpeshFacts *facts     = arg_idx < MAX_ARGS_FOR_OPT
+            ? arg_info->arg_facts[arg_idx]
+            : NULL;
+        if (type_tuple) {
+            MVMuint64 tt_offset = arg_idx >= arg_info->cs->num_pos
+                ? (arg_idx - arg_info->cs->num_pos) / 2
+                : arg_idx;
+            MVMuint32 is_rw = type_tuple[tt_offset].rw_cont;
+            MVMSTable *known_type_st;
+            MVMuint32 is_conc;
+            if (type_tuple[tt_offset].decont_type) {
+                known_type_st = type_tuple[tt_offset].decont_type->st;
+                is_conc = type_tuple[tt_offset].decont_type_concrete;
+            }
+            else {
+                known_type_st = type_tuple[tt_offset].type->st;
+                is_conc = type_tuple[tt_offset].type_concrete;
+            }
+
+            /* Now check if what we have matches what we need. */
+            if (known_type_st->type_cache_id == type_id) {
+                MVMuint32 need_concrete = (arg_match & MVM_MULTICACHE_ARG_CONC_FILTER) ? 1 : 0;
+                if (is_conc == need_concrete) {
+                    MVMuint32 need_rw = (arg_match & MVM_MULTICACHE_ARG_RW_FILTER) ? 1 : 0;
+                    if (need_rw == is_rw) {
+                        cur_node = tree[cur_node].match;
+                        continue;
+                    }
+                }
+            }
+            cur_node = tree[cur_node].no_match;
+        }
+        else if (facts) {
             /* Figure out type, concreteness, and rw-ness from facts. */
             MVMSTable *known_type_st;
             MVMuint32  is_conc;

@@ -34,9 +34,10 @@ static const MVMOpInfo * get_op_info(MVMThreadContext *tc, MVMCompUnit *cu, MVMu
 }
 
 /* Records a de-optimization annotation and mapping pair. */
-static void add_deopt_annotation(MVMThreadContext *tc, MVMSpeshGraph *g, MVMSpeshIns *ins_node,
-                                 MVMuint8 *pc, MVMint32 type) {
-    /* Add an the annotations. */
+void MVM_spesh_graph_add_deopt_annotation(MVMThreadContext *tc, MVMSpeshGraph *g,
+                                          MVMSpeshIns *ins_node, MVMuint32 deopt_target,
+                                          MVMint32 type) {
+    /* Add an annotations. */
     MVMSpeshAnn *ann      = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
     ann->type             = type;
     ann->data.deopt_idx   = g->num_deopt_addrs;
@@ -52,8 +53,19 @@ static void add_deopt_annotation(MVMThreadContext *tc, MVMSpeshGraph *g, MVMSpes
         else
             g->deopt_addrs = MVM_malloc(g->alloc_deopt_addrs * sizeof(MVMint32) * 2);
     }
-    g->deopt_addrs[2 * g->num_deopt_addrs] = pc - g->bytecode;
+    g->deopt_addrs[2 * g->num_deopt_addrs] = deopt_target;
     g->num_deopt_addrs++;
+}
+
+/* Records the current bytecode position as a logged annotation. Used for
+ * resolving logged values. */
+static void add_logged_annotation(MVMThreadContext *tc, MVMSpeshGraph *g, MVMSpeshIns *ins_node,
+                                  MVMuint8 *pc) {
+    MVMSpeshAnn *ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+    ann->type = MVM_SPESH_ANN_LOGGED;
+    ann->data.bytecode_offset = pc - g->bytecode;
+    ann->next = ins_node->annotations;
+    ins_node->annotations = ann;
 }
 
 /* Finds the linearly previous basic block (not cheap, but uncommon). */
@@ -67,10 +79,25 @@ MVMSpeshBB * MVM_spesh_graph_linear_prev(MVMThreadContext *tc, MVMSpeshGraph *g,
     return NULL;
 }
 
+/* Checks if a handler is a catch handler or a control handler. */
+static MVMint32 is_catch_handler(MVMThreadContext *tc, MVMSpeshGraph *g, MVMint32 handler_idx) {
+    return g->handlers[handler_idx].category_mask & MVM_EX_CAT_CATCH;
+}
+
+/* Checks if a basic block already has a particular successor. */
+static MVMint32 already_succs(MVMThreadContext *tc, MVMSpeshBB *bb, MVMSpeshBB *succ) {
+    MVMint32 i = 0;
+    for (i = 0; i < bb->num_succ; i++)
+        if (bb->succ[i] == succ)
+            return 1;
+    return 0;
+}
+
 /* Builds the control flow graph, populating the passed spesh graph structure
  * with it. This also makes nodes for all of the instruction. */
 #define MVM_CFG_BB_START    1
 #define MVM_CFG_BB_END      2
+#define MVM_CFG_BB_JUMPLIST 4
 static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf,
                       MVMint32 *existing_deopts, MVMint32 num_existing_deopts) {
     MVMSpeshBB  *cur_bb, *prev_bb;
@@ -86,15 +113,21 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
      * integer. This is used for two things:
      * A) When we make the MVMSpeshIns for an instruction starting at the
      *    byte, we put the instruction index (into ins_flat) in the slot,
-     *    shifting it by 2 bits to the left. We will use this to do fixups.
+     *    shifting it by 3 bits to the left. We will use this to do fixups.
      * B) The first bit is "I have an incoming branch" - that is, start of
      *    a basic block. The second bit is "I can branch" - that is, end of
-     *    a basic block. It's possible to have both bits set.
+     *    a basic block. It's possible to have both bits set. If it's part
+     *    of a jumplist, it gets the third bit set also.
      * Anything that's just a zero has no instruction starting there. */
     MVMuint32 *byte_to_ins_flags = MVM_calloc(g->bytecode_size, sizeof(MVMuint32));
 
     /* Instruction to basic block mapping. Initialized later. */
     MVMSpeshBB **ins_to_bb = NULL;
+
+    /* Which handlers are active; used for placing edges from blocks covered
+     * by execption handlers. */
+    MVMuint8 *active_handlers = MVM_calloc(1, g->num_handlers);
+    MVMint32 num_active_handlers = 0;
 
     /* Make first pass through the bytecode. In this pass, we make MVMSpeshIns
      * nodes for each instruction and set the start/end of block bits. Also
@@ -104,8 +137,18 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
     MVMuint8    *end      = g->bytecode + g->bytecode_size;
     MVMuint32    ins_idx  = 0;
     MVMuint8     next_bbs = 1; /* Next iteration (here, first) starts a BB. */
-    for (i = 0; i < g->num_handlers; i++)
-        byte_to_ins_flags[g->handlers[i].goto_offset] |= MVM_CFG_BB_START;
+    MVMuint32    lineno_ann_offs = 0;
+    MVMuint32    num_osr_points = 0;
+
+    MVMBytecodeAnnotation *ann_ptr = MVM_bytecode_resolve_annotation(tc, &sf->body, sf->body.bytecode - pc);
+
+    for (i = 0; i < g->num_handlers; i++) {
+        if (g->handlers[i].start_offset != -1 && g->handlers[i].goto_offset != -1) {
+            byte_to_ins_flags[g->handlers[i].start_offset] |= MVM_CFG_BB_START;
+            byte_to_ins_flags[g->handlers[i].end_offset] |= MVM_CFG_BB_START;
+            byte_to_ins_flags[g->handlers[i].goto_offset] |= MVM_CFG_BB_START;
+        }
+    }
     while (pc < end) {
         /* Look up op info. */
         MVMuint16  opcode     = *(MVMuint16 *)pc;
@@ -116,7 +159,7 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
         /* Create an instruction node, add it, and record its position. */
         MVMSpeshIns *ins_node = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshIns));
         ins_flat[ins_idx] = ins_node;
-        byte_to_ins_flags[pc - g->bytecode] |= ins_idx << 2;
+        byte_to_ins_flags[pc - g->bytecode] |= ins_idx << 3;
 
         /* Did previous instruction end a basic block? */
         if (next_bbs) {
@@ -137,6 +180,23 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
 
         /* Store opcode */
         ins_node->info = info;
+
+        /* If this is a pre-instruction deopt point opcode, annotate. */
+        if (!existing_deopts && (info->deopt_point & MVM_DEOPT_MARK_ONE_PRE))
+            MVM_spesh_graph_add_deopt_annotation(tc, g, ins_node,
+                pc - g->bytecode, MVM_SPESH_ANN_DEOPT_ONE_INS);
+
+        /* Let's see if we have a line-number annotation */
+        if (ann_ptr && pc - sf->body.bytecode == ann_ptr->bytecode_offset) {
+            MVMSpeshAnn *lineno_ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+            lineno_ann->next = ins_node->annotations;
+            lineno_ann->type = MVM_SPESH_ANN_LINENO;
+            lineno_ann->data.lineno.filename_string_index = ann_ptr->filename_string_heap_index;
+            lineno_ann->data.lineno.line_number = ann_ptr->line_number;
+            ins_node->annotations = lineno_ann;
+
+            MVM_bytecode_advance_annotation(tc, &sf->body, ann_ptr);
+        }
 
         /* Go over operands. */
         ins_node->operands = MVM_spesh_alloc(tc, g, info->num_operands * sizeof(MVMSpeshOperand));
@@ -168,6 +228,10 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
                     break;
                 case MVM_operand_int32:
                     ins_node->operands[i].lit_i32 = GET_I32(args, arg_size);
+                    arg_size += 4;
+                    break;
+                case MVM_operand_uint32:
+                    ins_node->operands[i].lit_ui32 = GET_UI32(args, arg_size);
                     arg_size += 4;
                     break;
                 case MVM_operand_int64:
@@ -240,11 +304,14 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
         if (opcode == MVM_OP_jumplist) {
             MVMint64 n = MVM_BC_get_I64(args, 0);
             for (i = 0; i <= n; i++)
-                byte_to_ins_flags[(pc - g->bytecode) + 12 + i * 6] |= MVM_CFG_BB_START;
+                byte_to_ins_flags[(pc - g->bytecode) + 12 + i * 6] |=
+                    MVM_CFG_BB_START | MVM_CFG_BB_JUMPLIST;
             byte_to_ins_flags[pc - g->bytecode] |= MVM_CFG_BB_END;
         }
 
-        /* Invocations, returns, and throws are basic block ends. */
+        /* Invoke and return end a basic block. Anything that is marked as
+         * invokish and throwish are also basic block ends. OSR points are
+         * basic block starts. */
         switch (opcode) {
         case MVM_OP_invoke_v:
         case MVM_OP_invoke_i:
@@ -256,19 +323,23 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
         case MVM_OP_return_s:
         case MVM_OP_return_o:
         case MVM_OP_return:
-        case MVM_OP_throwdyn:
-        case MVM_OP_throwlex:
-        case MVM_OP_throwlexotic:
-        case MVM_OP_throwcatdyn:
-        case MVM_OP_throwcatlex:
-        case MVM_OP_throwcatlexotic:
-        case MVM_OP_die:
-        case MVM_OP_rethrow:
-        case MVM_OP_resume:
             byte_to_ins_flags[pc - g->bytecode] |= MVM_CFG_BB_END;
             next_bbs = 1;
             break;
+        case MVM_OP_osrpoint:
+            byte_to_ins_flags[pc - g->bytecode] |= MVM_CFG_BB_START;
+            if (pc - g->bytecode > 0) {
+                MVMuint32 prev = pc - g->bytecode;
+                while (!byte_to_ins_flags[--prev]);
+                byte_to_ins_flags[prev] |= MVM_CFG_BB_END;
+            }
+            num_osr_points++;
+            break;
         default:
+            if (info->jittivity & (MVM_JIT_INFO_THROWISH | MVM_JIT_INFO_INVOKISH)) {
+                byte_to_ins_flags[pc - g->bytecode] |= MVM_CFG_BB_END;
+                next_bbs = 1;
+            }
             break;
         }
 
@@ -276,16 +347,24 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
         if (pc + 2 + arg_size == end)
             byte_to_ins_flags[pc - g->bytecode] |= MVM_CFG_BB_END;
 
+        /* If the instruction is logged, store its program counter so we can
+         * associate it with a static value later. */
+        if (info->logged)
+            add_logged_annotation(tc, g, ins_node, pc);
+
         /* Caculate next instruction's PC. */
         pc += 2 + arg_size;
 
-        /* If this is a deopt point opcode... */
+        /* If this is a post-instruction deopt point opcode... */
         if (!existing_deopts && (info->deopt_point & MVM_DEOPT_MARK_ONE))
-            add_deopt_annotation(tc, g, ins_node, pc, MVM_SPESH_ANN_DEOPT_ONE_INS);
+            MVM_spesh_graph_add_deopt_annotation(tc, g, ins_node,
+                pc - g->bytecode, MVM_SPESH_ANN_DEOPT_ONE_INS);
         if (!existing_deopts && (info->deopt_point & MVM_DEOPT_MARK_ALL))
-            add_deopt_annotation(tc, g, ins_node, pc, MVM_SPESH_ANN_DEOPT_ALL_INS);
+            MVM_spesh_graph_add_deopt_annotation(tc, g, ins_node,
+                pc - g->bytecode, MVM_SPESH_ANN_DEOPT_ALL_INS);
         if (!existing_deopts && (info->deopt_point & MVM_DEOPT_MARK_OSR))
-            add_deopt_annotation(tc, g, ins_node, pc, MVM_SPESH_ANN_DEOPT_OSR);
+            MVM_spesh_graph_add_deopt_annotation(tc, g, ins_node,
+                pc - g->bytecode, MVM_SPESH_ANN_DEOPT_OSR);
 
         /* Go to next instruction. */
         ins_idx++;
@@ -293,52 +372,64 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
 
     /* Annotate instructions that are handler-significant. */
     for (i = 0; i < g->num_handlers; i++) {
-        MVMSpeshIns *start_ins = ins_flat[byte_to_ins_flags[g->handlers[i].start_offset] >> 2];
-        MVMSpeshIns *end_ins   = ins_flat[byte_to_ins_flags[g->handlers[i].end_offset] >> 2];
-        MVMSpeshIns *goto_ins  = ins_flat[byte_to_ins_flags[g->handlers[i].goto_offset] >> 2];
-        MVMSpeshAnn *start_ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
-        MVMSpeshAnn *end_ann   = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
-        MVMSpeshAnn *goto_ann  = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+        /* Start or got may be -1 if they the code the handler covered became
+         * dead. If so, mark the handler as removed. */
+        if (g->handlers[i].start_offset == -1 || g->handlers[i].goto_offset == -1) {
+            if (!g->unreachable_handlers)
+                g->unreachable_handlers = MVM_spesh_alloc(tc, g, g->num_handlers);
+            g->unreachable_handlers[i] = 1;
+        }
+        else {
+            MVMSpeshIns *start_ins = ins_flat[byte_to_ins_flags[g->handlers[i].start_offset] >> 3];
+            MVMSpeshIns *end_ins   = ins_flat[byte_to_ins_flags[g->handlers[i].end_offset] >> 3];
+            MVMSpeshAnn *start_ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+            MVMSpeshAnn *end_ann   = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+            MVMSpeshIns *goto_ins  = ins_flat[byte_to_ins_flags[g->handlers[i].goto_offset] >> 3];
+            MVMSpeshAnn *goto_ann  = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
 
-        start_ann->next = start_ins->annotations;
-        start_ann->type = MVM_SPESH_ANN_FH_START;
-        start_ann->data.frame_handler_index = i;
-        start_ins->annotations = start_ann;
+            start_ann->next = start_ins->annotations;
+            start_ann->type = MVM_SPESH_ANN_FH_START;
+            start_ann->data.frame_handler_index = i;
+            start_ins->annotations = start_ann;
 
-        end_ann->next = end_ins->annotations;
-        end_ann->type = MVM_SPESH_ANN_FH_END;
-        end_ann->data.frame_handler_index = i;
-        end_ins->annotations = end_ann;
+            end_ann->next = end_ins->annotations;
+            end_ann->type = MVM_SPESH_ANN_FH_END;
+            end_ann->data.frame_handler_index = i;
+            end_ins->annotations = end_ann;
 
-        goto_ann->next = goto_ins->annotations;
-        goto_ann->type = MVM_SPESH_ANN_FH_GOTO;
-        goto_ann->data.frame_handler_index = i;
-        goto_ins->annotations = goto_ann;
+            goto_ann->next = goto_ins->annotations;
+            goto_ann->type = MVM_SPESH_ANN_FH_GOTO;
+            goto_ann->data.frame_handler_index = i;
+            goto_ins->annotations = goto_ann;
+        }
     }
 
     /* Annotate instructions that are inline start/end points. */
     for (i = 0; i < g->num_inlines; i++) {
-        MVMSpeshIns *start_ins = ins_flat[byte_to_ins_flags[g->inlines[i].start] >> 2];
-        MVMSpeshIns *end_ins   = ins_flat[byte_to_ins_flags[g->inlines[i].end] >> 2];
-        MVMSpeshAnn *start_ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
-        MVMSpeshAnn *end_ann   = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+        if (!g->inlines[i].unreachable) {
+            MVMSpeshIns *start_ins = ins_flat[byte_to_ins_flags[g->inlines[i].start] >> 3];
+            MVMSpeshIns *end_ins   = ins_flat[byte_to_ins_flags[g->inlines[i].end] >> 3];
+            MVMSpeshAnn *start_ann = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
+            MVMSpeshAnn *end_ann   = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
 
-        start_ann->next = start_ins->annotations;
-        start_ann->type = MVM_SPESH_ANN_INLINE_START;
-        start_ann->data.inline_idx = i;
-        start_ins->annotations = start_ann;
+            start_ann->next = start_ins->annotations;
+            start_ann->type = MVM_SPESH_ANN_INLINE_START;
+            start_ann->data.inline_idx = i;
+            start_ins->annotations = start_ann;
 
-        end_ann->next = end_ins->annotations;
-        end_ann->type = MVM_SPESH_ANN_INLINE_END;
-        end_ann->data.inline_idx = i;
-        end_ins->annotations = end_ann;
+            end_ann->next = end_ins->annotations;
+            end_ann->type = MVM_SPESH_ANN_INLINE_END;
+            end_ann->data.inline_idx = i;
+            end_ins->annotations = end_ann;
+        }
     }
 
     /* Now for the second pass, where we assemble the basic blocks. Also we
      * build a lookup table of instructions that start a basic block to that
      * basic block, for the final CFG construction. We make the entry block a
-     * special one, containing a noop; it will have any exception handler
-     * targets linked from it, so they show up in the graph. */
+     * special one, containing a noop; it will have any catch exception
+     * handler targets linked from it, so they show up in the graph. For any
+     * control exceptions, we will insert  */
     g->entry                  = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshBB));
     g->entry->first_ins       = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshIns));
     g->entry->first_ins->info = get_op_info(tc, cu, 0);
@@ -358,7 +449,7 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
             continue;
 
         /* Get current instruction. */
-        cur_ins = ins_flat[byte_to_ins_flags[i] >> 2];
+        cur_ins = ins_flat[byte_to_ins_flags[i] >> 3];
 
         /* Start of a basic block? */
         if (byte_to_ins_flags[i] & MVM_CFG_BB_START) {
@@ -373,6 +464,7 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
             cur_bb->first_ins = cur_ins;
             cur_bb->idx = bb_idx;
             cur_bb->initial_pc = i;
+            cur_bb->jumplist = byte_to_ins_flags[i] & MVM_CFG_BB_JUMPLIST;
             bb_idx++;
 
             /* Record instruction -> BB start mapping. */
@@ -408,41 +500,84 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
     g->num_bbs = bb_idx;
 
     /* Finally, link the basic blocks up to form a CFG. Along the way, any of
-     * the instruction operands get the target BB stored. */
+     * the instruction operands get the target BB stored. This is where we
+     * link basic blocks covered by control exception handlers to the goto
+     * block of the handler also. */
     cur_bb = g->entry;
     while (cur_bb) {
         /* If it's the first block, it's a special case; successors are the
-         * real successor and all exception handlers. */
+         * real successor, all catch exception handlers, and all OSR points.
+         */
         if (cur_bb == g->entry) {
-            cur_bb->num_succ = 1 + g->num_handlers;
-            cur_bb->succ     = MVM_spesh_alloc(tc, g, cur_bb->num_succ * sizeof(MVMSpeshBB *));
+            MVMint32 num_bbs = 1 + g->num_handlers + num_osr_points;
+            MVMint32 insert_pos = 1;
+            cur_bb->succ     = MVM_spesh_alloc(tc, g, num_bbs * sizeof(MVMSpeshBB *));
             cur_bb->succ[0]  = cur_bb->linear_next;
             for (i = 0; i < g->num_handlers; i++) {
-                MVMuint32 offset = g->handlers[i].goto_offset;
-                cur_bb->succ[i + 1] = ins_to_bb[byte_to_ins_flags[offset] >> 2];
+                if (is_catch_handler(tc, g, i)) {
+                    MVMuint32 offset = g->handlers[i].goto_offset;
+                    if (offset != -1)
+                        cur_bb->succ[insert_pos++] = ins_to_bb[byte_to_ins_flags[offset] >> 3];
+                }
             }
+            if (num_osr_points > 0) {
+                MVMSpeshBB *search_bb = cur_bb->linear_next;
+                while (search_bb) {
+                    if (search_bb->first_ins->info->opcode == MVM_OP_osrpoint)
+                        cur_bb->succ[insert_pos++] = search_bb;
+                    search_bb = search_bb->linear_next;
+                }
+            }
+            cur_bb->num_succ = insert_pos;
         }
 
-        /* Otherwise, consider the last instruction, to see how we leave the BB. */
+        /* Otherwise, non-entry basic block. */
         else {
+            /* If this is the start of a frame handler that is not a catch,
+             * mark it as an active handler. Unmark those where we see the
+             * end of the handler. */
+            if (cur_bb->first_ins->annotations) {
+                MVMSpeshAnn *ann = cur_bb->first_ins->annotations;
+                while (ann) {
+                    switch (ann->type) {
+                        case MVM_SPESH_ANN_FH_START:
+                            if (!is_catch_handler(tc, g, ann->data.frame_handler_index)) {
+                                active_handlers[ann->data.frame_handler_index] = 1;
+                                num_active_handlers++;
+                            }
+                            break;
+                        case MVM_SPESH_ANN_FH_END:
+                            if (!is_catch_handler(tc, g, ann->data.frame_handler_index)) {
+                                active_handlers[ann->data.frame_handler_index] = 0;
+                                num_active_handlers--;
+                            }
+                            break;
+                    }
+                    ann = ann->next;
+                }
+            }
+
+            /* Consider the last instruction, to see how we leave the BB. */
             switch (cur_bb->last_ins->info->opcode) {
                 case MVM_OP_jumplist: {
                     /* Jumplist, so successors are next N+1 basic blocks. */
-                    MVMint64    num_bbs   = cur_bb->last_ins->operands[0].lit_i64 + 1;
+                    MVMint64 jump_bbs = cur_bb->last_ins->operands[0].lit_i64 + 1;
+                    MVMint64 num_bbs = jump_bbs + num_active_handlers;
                     MVMSpeshBB *bb_to_add = cur_bb->linear_next;
-                    cur_bb->succ          = MVM_spesh_alloc(tc, g, num_bbs * sizeof(MVMSpeshBB *));
-                    for (i = 0; i < num_bbs; i++) {
+                    cur_bb->succ = MVM_spesh_alloc(tc, g, num_bbs * sizeof(MVMSpeshBB *));
+                    for (i = 0; i < jump_bbs; i++) {
                         cur_bb->succ[i] = bb_to_add;
                         bb_to_add = bb_to_add->linear_next;
                     }
-                    cur_bb->num_succ = num_bbs;
+                    cur_bb->num_succ = jump_bbs;
                 }
                 break;
                 case MVM_OP_goto: {
                     /* Unconditional branch, so one successor. */
+                    MVMint64 num_bbs = 1 + num_active_handlers;
                     MVMuint32   offset = cur_bb->last_ins->operands[0].ins_offset;
-                    MVMSpeshBB *tgt    = ins_to_bb[byte_to_ins_flags[offset] >> 2];
-                    cur_bb->succ       = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshBB *));
+                    MVMSpeshBB *tgt    = ins_to_bb[byte_to_ins_flags[offset] >> 3];
+                    cur_bb->succ       = MVM_spesh_alloc(tc, g, num_bbs * sizeof(MVMSpeshBB *));
                     cur_bb->succ[0]    = tgt;
                     cur_bb->num_succ   = 1;
                     cur_bb->last_ins->operands[0].ins_bb = tgt;
@@ -452,11 +587,12 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
                     /* Probably conditional branch, so two successors: one from
                      * the instruction, another from fall-through. Or may just be
                      * a non-branch that exits for other reasons. */
-                    cur_bb->succ = MVM_spesh_alloc(tc, g, 2 * sizeof(MVMSpeshBB *));
+                    MVMint64 num_bbs = 2 + num_active_handlers;
+                    cur_bb->succ = MVM_spesh_alloc(tc, g, num_bbs * sizeof(MVMSpeshBB *));
                     for (i = 0; i < cur_bb->last_ins->info->num_operands; i++) {
                         if (cur_bb->last_ins->info->operands[i] == MVM_operand_ins) {
                             MVMuint32 offset = cur_bb->last_ins->operands[i].ins_offset;
-                            cur_bb->succ[0] = ins_to_bb[byte_to_ins_flags[offset] >> 2];
+                            cur_bb->succ[0] = ins_to_bb[byte_to_ins_flags[offset] >> 3];
                             cur_bb->num_succ++;
                             cur_bb->last_ins->operands[i].ins_bb = cur_bb->succ[0];
                         }
@@ -474,6 +610,20 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
                 }
                 break;
             }
+
+            /* Attach this block to the goto block of any active handlers. */
+            if (num_active_handlers) {
+                for (i = 0; i < g->num_handlers; i++) {
+                    if (active_handlers[i]) {
+                        MVMuint32 offset = g->handlers[i].goto_offset;
+                        MVMSpeshBB *target = ins_to_bb[byte_to_ins_flags[offset] >> 3];
+                        if (!already_succs(tc, cur_bb, target)) {
+                            cur_bb->succ[cur_bb->num_succ] = target;
+                            cur_bb->num_succ++;
+                        }
+                    }
+                }
+            }
         }
 
         /* Move on to next block. */
@@ -485,10 +635,10 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
     if (existing_deopts) {
         for (i = 0; i < num_existing_deopts; i ++) {
             if (existing_deopts[2 * i + 1] >= 0) {
-                MVMSpeshIns *post_ins     = ins_flat[byte_to_ins_flags[existing_deopts[2 * i + 1]] >> 2];
+                MVMSpeshIns *post_ins     = ins_flat[byte_to_ins_flags[existing_deopts[2 * i + 1]] >> 3];
                 MVMSpeshIns *deopt_ins    = post_ins->prev ? post_ins->prev :
                     MVM_spesh_graph_linear_prev(tc, g,
-                        ins_to_bb[byte_to_ins_flags[existing_deopts[2 * i + 1]] >> 2])->last_ins;
+                        ins_to_bb[byte_to_ins_flags[existing_deopts[2 * i + 1]] >> 3])->last_ins;
                 MVMSpeshAnn *deopt_ann    = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshAnn));
                 deopt_ann->next           = deopt_ins->annotations;
                 deopt_ann->type           = MVM_SPESH_ANN_DEOPT_INLINE;
@@ -502,6 +652,8 @@ static void build_cfg(MVMThreadContext *tc, MVMSpeshGraph *g, MVMStaticFrame *sf
     MVM_free(byte_to_ins_flags);
     MVM_free(ins_flat);
     MVM_free(ins_to_bb);
+    MVM_free(ann_ptr);
+    MVM_free(active_handlers);
 }
 
 /* Inserts nulling of object reigsters. A later stage of the optimizer will
@@ -530,53 +682,6 @@ static void insert_object_null_instructions(MVMThreadContext *tc, MVMSpeshGraph 
             null_ins->operands = MVM_spesh_alloc(tc, g, sizeof(MVMSpeshOperand));
             null_ins->operands[0].reg.orig = i;
             MVM_spesh_manipulate_insert_ins(tc, insert_bb, NULL, null_ins);
-        }
-    }
-}
-
-/* Eliminates any unreachable basic blocks (that is, dead code). Not having
- * to consider them any further simplifies all that follows. */
-static void eliminate_dead(MVMThreadContext *tc, MVMSpeshGraph *g) {
-    /* Iterate to fixed point. */
-    MVMint8  *seen     = MVM_malloc(g->num_bbs);
-    MVMint32  orig_bbs = g->num_bbs;
-    MVMint8   death    = 1;
-    while (death) {
-        /* First pass: mark every basic block that is the entry point or the
-         * successor of some other block. */
-        MVMSpeshBB *cur_bb = g->entry;
-        memset(seen, 0, g->num_bbs);
-        seen[0] = 1;
-        while (cur_bb) {
-            MVMuint16 i;
-            for (i = 0; i < cur_bb->num_succ; i++)
-                seen[cur_bb->succ[i]->idx] = 1;
-            cur_bb = cur_bb->linear_next;
-        }
-
-        /* Second pass: eliminate dead BBs from consideration. */
-        death = 0;
-        cur_bb = g->entry;
-        while (cur_bb->linear_next) {
-            if (!seen[cur_bb->linear_next->idx]) {
-                cur_bb->linear_next = cur_bb->linear_next->linear_next;
-                g->num_bbs--;
-                death = 1;
-            }
-            cur_bb = cur_bb->linear_next;
-        }
-    }
-    MVM_free(seen);
-
-    /* If we removed some, need to re-number so they're consecutive, for the
-     * post-order and dominance calcs to be happy. */
-    if (g->num_bbs != orig_bbs) {
-        MVMint32    new_idx  = 0;
-        MVMSpeshBB *cur_bb   = g->entry;
-        while (cur_bb) {
-            cur_bb->idx = new_idx;
-            new_idx++;
-            cur_bb = cur_bb->linear_next;
         }
     }
 }
@@ -1102,7 +1207,7 @@ MVMSpeshGraph * MVM_spesh_graph_create(MVMThreadContext *tc, MVMStaticFrame *sf,
     if (insert_object_nulls)
         insert_object_null_instructions(tc, g);
     if (!cfg_only) {
-        eliminate_dead(tc, g);
+        MVM_spesh_eliminate_dead_bbs(tc, g, 0);
         add_predecessors(tc, g);
         ssa(tc, g);
     }
@@ -1128,6 +1233,7 @@ MVMSpeshGraph * MVM_spesh_graph_create_from_cand(MVMThreadContext *tc, MVMStatic
     g->deopt_addrs       = cand->deopts;
     g->num_deopt_addrs   = cand->num_deopts;
     g->alloc_deopt_addrs = cand->num_deopts;
+    g->deopt_named_used_bit_field = cand->deopt_named_used_bit_field;
     g->local_types       = cand->local_types;
     g->lexical_types     = cand->lexical_types;
     g->spesh_slots       = cand->spesh_slots;
@@ -1144,7 +1250,7 @@ MVMSpeshGraph * MVM_spesh_graph_create_from_cand(MVMThreadContext *tc, MVMStatic
     /* Build the CFG out of the static frame, and transform it to SSA. */
     build_cfg(tc, g, sf, cand->deopts, cand->num_deopts);
     if (!cfg_only) {
-        eliminate_dead(tc, g);
+        MVM_spesh_eliminate_dead_bbs(tc, g, 0);
         add_predecessors(tc, g);
         ssa(tc, g);
     }

@@ -1,20 +1,29 @@
 #include "moar.h"
 
+MVM_STATIC_INLINE MVMint32 is_named_used(MVMArgProcContext *ctx, MVMuint32 idx) {
+    return ctx->named_used_size > 64
+        ? ctx->named_used.byte_array[idx]
+        : ctx->named_used.bit_field & ((MVMuint64)1 << idx);
+}
+
+MVM_STATIC_INLINE void mark_named_used(MVMArgProcContext *ctx, MVMuint32 idx) {
+    if (ctx->named_used_size > 64)
+        ctx->named_used.byte_array[idx] = 1;
+    else
+        ctx->named_used.bit_field |= (MVMuint64)1 << idx;
+}
+
+/* Marks a named used in the current callframe. */
+void MVM_args_marked_named_used(MVMThreadContext *tc, MVMuint32 idx) {
+    mark_named_used(&(tc->cur_frame->params), idx);
+}
+
 static void init_named_used(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint16 num) {
-    if (ctx->named_used && ctx->named_used_size >= num) { /* reuse the old one */
-        memset(ctx->named_used, 0, ctx->named_used_size * sizeof(MVMuint8));
-    }
-    else {
-        if (ctx->named_used) {
-            MVM_fixed_size_free(tc, tc->instance->fsa, ctx->named_used_size,
-                ctx->named_used);
-            ctx->named_used = NULL;
-        }
-        ctx->named_used_size = num;
-        ctx->named_used = ctx->named_used_size
-            ? MVM_fixed_size_alloc_zeroed(tc, tc->instance->fsa, num)
-            : NULL;
-    }
+    ctx->named_used_size = num;
+    if (num > 64)
+        ctx->named_used.byte_array = MVM_fixed_size_alloc_zeroed(tc, tc->instance->fsa, num); 
+    else
+        ctx->named_used.bit_field = 0;
 }
 
 /* Initialize arguments processing context. */
@@ -35,13 +44,14 @@ void MVM_args_proc_cleanup(MVMThreadContext *tc, MVMArgProcContext *ctx) {
         MVM_free(ctx->arg_flags);
         MVM_free(ctx->args);
     }
-    if (ctx->named_used) {
+    if (ctx->named_used_size > 64) {
         MVM_fixed_size_free(tc, tc->instance->fsa, ctx->named_used_size,
-            ctx->named_used);
-        ctx->named_used = NULL;
+            ctx->named_used.byte_array);
+        ctx->named_used_size = 0;
     }
 }
 
+/* Make a copy of the callsite. */
 MVMCallsite * MVM_args_copy_callsite(MVMThreadContext *tc, MVMArgProcContext *ctx) {
     MVMCallsite      *res   = MVM_calloc(1, sizeof(MVMCallsite));
     MVMCallsiteEntry *flags = NULL;
@@ -68,18 +78,11 @@ MVMCallsite * MVM_args_copy_callsite(MVMThreadContext *tc, MVMArgProcContext *ct
     return res;
 }
 
-/* Turn an argument processing context into a callsite. In the case that no
- * flattening happened, this is the original call site. Otherwise, we make
- * one up. */
-MVMCallsite * MVM_args_proc_to_callsite(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint8 *owns_callsite) {
-    if (ctx->arg_flags) {
-        *owns_callsite = 1;
-        return MVM_args_copy_callsite(tc, ctx);
-    }
-    else {
-        *owns_callsite = 0;
-        return ctx->callsite;
-    }
+/* Copy a callsite unless it is interned. */
+MVMCallsite * MVM_args_copy_uninterned_callsite(MVMThreadContext *tc, MVMArgProcContext *ctx) {
+    return ctx->callsite->is_interned && !ctx->arg_flags
+        ? ctx->callsite
+        : MVM_args_copy_callsite(tc, ctx);
 }
 
 MVMObject * MVM_args_use_capture(MVMThreadContext *tc, MVMFrame *f) {
@@ -92,21 +95,22 @@ MVMObject * MVM_args_use_capture(MVMThreadContext *tc, MVMFrame *f) {
 }
 
 MVMObject * MVM_args_save_capture(MVMThreadContext *tc, MVMFrame *frame) {
-    MVMObject *cc_obj = MVM_repr_alloc_init(tc, tc->instance->CallCapture);
-    MVMCallCapture *cc = (MVMCallCapture *)cc_obj;
+    MVMObject *cc_obj;
+    MVMROOT(tc, frame, {
+        MVMCallCapture *cc = (MVMCallCapture *)
+            (cc_obj = MVM_repr_alloc_init(tc, tc->instance->CallCapture));
 
-    /* Copy the arguments. */
-    MVMuint32 arg_size = frame->params.arg_count * sizeof(MVMRegister);
-    MVMRegister *args = MVM_malloc(arg_size);
-    memcpy(args, frame->params.args, arg_size);
+        /* Copy the arguments. */
+        MVMuint32 arg_size = frame->params.arg_count * sizeof(MVMRegister);
+        MVMRegister *args = MVM_malloc(arg_size);
+        memcpy(args, frame->params.args, arg_size);
 
-    /* Create effective callsite. */
-    cc->body.effective_callsite = MVM_args_proc_to_callsite(tc, &frame->params, &cc->body.owns_callsite);
-
-    /* Set up the call capture. */
-    cc->body.mode = MVM_CALL_CAPTURE_MODE_SAVE;
-    cc->body.apc  = (MVMArgProcContext *)MVM_calloc(1, sizeof(MVMArgProcContext));
-    MVM_args_proc_init(tc, cc->body.apc, cc->body.effective_callsite, args);
+        /* Set up the call capture, copying the callsite. */
+        cc->body.apc  = (MVMArgProcContext *)MVM_calloc(1, sizeof(MVMArgProcContext));
+        MVM_args_proc_init(tc, cc->body.apc,
+            MVM_args_copy_uninterned_callsite(tc, &frame->params),
+            args);
+    });
     return cc_obj;
 }
 
@@ -279,15 +283,27 @@ static MVMObject * decont_arg(MVMThreadContext *tc, MVMObject *arg) {
     } \
 } while (0)
 
-MVMArgInfo MVM_args_get_pos_obj(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos, MVMuint8 required) {
+MVMObject * MVM_args_get_required_pos_obj(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos) {
     MVMArgInfo result;
-    args_get_pos(tc, ctx, pos, required, result);
+    args_get_pos(tc, ctx, pos, MVM_ARG_REQUIRED, result);
+    autobox_switch(tc, result);
+    return result.arg.o;
+}
+MVMArgInfo MVM_args_get_optional_pos_obj(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos) {
+    MVMArgInfo result;
+    args_get_pos(tc, ctx, pos, MVM_ARG_OPTIONAL, result);
     autobox_switch(tc, result);
     return result;
 }
-MVMArgInfo MVM_args_get_pos_int(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos, MVMuint8 required) {
+MVMint64 MVM_args_get_required_pos_int(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos) {
     MVMArgInfo result;
-    args_get_pos(tc, ctx, pos, required, result);
+    args_get_pos(tc, ctx, pos, MVM_ARG_REQUIRED, result);
+    autounbox(tc, MVM_CALLSITE_ARG_INT, "integer", result);
+    return result.arg.i64;
+}
+MVMArgInfo MVM_args_get_optional_pos_int(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMuint32 pos) {
+    MVMArgInfo result;
+    args_get_pos(tc, ctx, pos, MVM_ARG_OPTIONAL, result);
     autounbox(tc, MVM_CALLSITE_ARG_INT, "integer", result);
     return result;
 }
@@ -318,15 +334,11 @@ MVMArgInfo MVM_args_get_pos_uint(MVMThreadContext *tc, MVMArgProcContext *ctx, M
      \
     for (flag_pos = arg_pos = ctx->num_pos; arg_pos < ctx->arg_count; flag_pos++, arg_pos += 2) { \
         if (MVM_string_equal(tc, ctx->args[arg_pos].s, name)) { \
-            if (ctx->named_used[(arg_pos - ctx->num_pos)/2]) { \
-                char *c_name = MVM_string_utf8_encode_C_string(tc, name); \
-                char *waste[] = { c_name, NULL }; \
-                MVM_exception_throw_adhoc_free(tc, waste, "Named argument '%s' already used", c_name); \
-            } \
             result.arg    = ctx->args[arg_pos + 1]; \
             result.flags  = (ctx->arg_flags ? ctx->arg_flags : ctx->callsite->arg_flags)[flag_pos]; \
             result.exists = 1; \
-            ctx->named_used[(arg_pos - ctx->num_pos)/2] = 1; \
+            result.arg_idx = arg_pos + 1; \
+            mark_named_used(ctx, (arg_pos - ctx->num_pos)/2); \
             break; \
         } \
     } \
@@ -375,11 +387,11 @@ MVMint64 MVM_args_has_named(MVMThreadContext *tc, MVMArgProcContext *ctx, MVMStr
     return 0;
 }
 void MVM_args_assert_nameds_used(MVMThreadContext *tc, MVMArgProcContext *ctx) {
-    if (ctx->named_used) {
-        MVMuint16 size = (ctx->arg_count - ctx->num_pos) / 2;
-        MVMuint16 i;
+    MVMuint16 size = ctx->named_used_size;
+    MVMuint16 i;
+    if (size > 64) {
         for (i = 0; i < size; i++)
-            if (!ctx->named_used[i]) {
+            if (!ctx->named_used.byte_array[i]) {
                 char *c_param = MVM_string_utf8_encode_C_string(tc,
                     ctx->args[ctx->num_pos + 2 * i].s);
                 char *waste[] = { c_param, NULL };
@@ -388,6 +400,25 @@ void MVM_args_assert_nameds_used(MVMThreadContext *tc, MVMArgProcContext *ctx) {
                     c_param);
             }
     }
+    else {
+        for (i = 0; i < size; i++)
+            if (!(ctx->named_used.bit_field & ((MVMuint64)1 << i))) {
+                char *c_param = MVM_string_utf8_encode_C_string(tc,
+                    ctx->args[ctx->num_pos + 2 * i].s);
+                char *waste[] = { c_param, NULL };
+                MVM_exception_throw_adhoc_free(tc, waste,
+                    "Unexpected named argument '%s' passed",
+                    c_param);
+            }
+    }
+}
+
+void MVM_args_throw_named_unused_error(MVMThreadContext *tc, MVMString *name) {
+    char *c_param = MVM_string_utf8_encode_C_string(tc, name);
+    char *waste[] = { c_param, NULL };
+    MVM_exception_throw_adhoc_free(tc, waste,
+        "Unexpected named argument '%s' passed",
+        c_param);
 }
 
 /* Result setting. The frameless flag indicates that the currently
@@ -621,7 +652,8 @@ MVMObject * MVM_args_slurpy_named(MVMThreadContext *tc, MVMArgProcContext *ctx) 
     for (flag_pos = arg_pos = ctx->num_pos; arg_pos < ctx->arg_count; flag_pos++, arg_pos += 2) {
         MVMString *key;
 
-        if (ctx->named_used[flag_pos - ctx->num_pos]) continue;
+        if (is_named_used(ctx, flag_pos - ctx->num_pos))
+            continue;
 
         key = ctx->args[arg_pos].s;
 
@@ -805,6 +837,8 @@ static void flatten_args(MVMThreadContext *tc, MVMArgProcContext *ctx) {
         }
     }
 
+    if (ctx->named_used_size > 64)
+        MVM_fixed_size_free(tc, tc->instance->fsa, ctx->named_used_size, ctx->named_used.byte_array);
     init_named_used(tc, ctx, (new_arg_pos - new_num_pos) / 2);
     ctx->args = new_args;
     ctx->arg_count = new_arg_pos;
@@ -836,43 +870,26 @@ static void bind_error_return(MVMThreadContext *tc, void *sr_data) {
     MVM_frame_try_return(tc);
 }
 static void mark_sr_data(MVMThreadContext *tc, MVMFrame *frame, MVMGCWorklist *worklist) {
-    MVMRegister *r = (MVMRegister *)frame->special_return_data;
+    MVMRegister *r = (MVMRegister *)frame->extra->special_return_data;
     MVM_gc_worklist_add(tc, worklist, &r->o);
 }
 void MVM_args_bind_failed(MVMThreadContext *tc) {
-    MVMObject   *bind_error;
     MVMRegister *res;
     MVMCallsite *inv_arg_callsite;
-    MVMFrame *cur_frame = tc->cur_frame;
 
-    /* Create a new call capture object. */
-    MVMObject *cc_obj = MVM_repr_alloc_init(tc, tc->instance->CallCapture);
-    MVMCallCapture *cc = (MVMCallCapture *)cc_obj;
-
-    /* Copy the arguments. */
-    MVMuint32 arg_size = tc->cur_frame->params.arg_count * sizeof(MVMRegister);
-    MVMRegister *args = MVM_malloc(arg_size);
-    memcpy(args, tc->cur_frame->params.args, arg_size);
-
-    /* Create effective callsite. */
-    cc->body.effective_callsite = MVM_args_proc_to_callsite(tc, &tc->cur_frame->params, &cc->body.owns_callsite);
-
-    /* Set up the call capture. */
-    cc->body.mode = MVM_CALL_CAPTURE_MODE_SAVE;
-    cc->body.apc  = (MVMArgProcContext *)MVM_calloc(1, sizeof(MVMArgProcContext));
-    MVM_args_proc_init(tc, cc->body.apc, cc->body.effective_callsite, args);
+    /* Capture arguments into a call capture, to pass off for analysis. */
+    MVMObject *cc_obj = MVM_args_save_capture(tc, tc->cur_frame);
 
     /* Invoke the HLL's bind failure handler. */
-    bind_error = MVM_hll_current(tc)->bind_error;
+    MVMFrame *cur_frame = tc->cur_frame;
+    MVMObject *bind_error = MVM_hll_current(tc)->bind_error;
     if (!bind_error)
         MVM_exception_throw_adhoc(tc, "Bind error occurred, but HLL has no handler");
     bind_error = MVM_frame_find_invokee(tc, bind_error, NULL);
     res = MVM_calloc(1, sizeof(MVMRegister));
     inv_arg_callsite = MVM_callsite_get_common(tc, MVM_CALLSITE_ID_INV_ARG);
     MVM_args_setup_thunk(tc, res, MVM_RETURN_OBJ, inv_arg_callsite);
-    cur_frame->special_return           = bind_error_return;
-    cur_frame->special_return_data      = res;
-    cur_frame->mark_special_return_data = mark_sr_data;
+    MVM_frame_special_return(tc, cur_frame, bind_error_return, NULL, res, mark_sr_data);
     cur_frame->args[0].o = cc_obj;
     STABLE(bind_error)->invoke(tc, bind_error, inv_arg_callsite, cur_frame->args);
 }

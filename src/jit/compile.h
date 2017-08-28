@@ -11,22 +11,19 @@ struct MVMJitCode {
      * runtime (because we need a second dereference to figure the
      * labels out), but very simple for me now, and super-easy to
      * optimise at a later date */
-    MVMint32   num_labels;
-    void     **labels;
-
-    MVMint32       num_bbs;
+    MVMint32       num_labels; /* for labels */
+    MVMint32       num_bbs;    /* for bb_labels */
+    void         **labels;
     MVMint32      *bb_labels;
 
     MVMint32       num_deopts;
-    MVMJitDeopt    *deopts;
-
     MVMint32       num_inlines;
+    MVMJitDeopt    *deopts;
     MVMJitInline  *inlines;
 
-    MVMint32       num_handlers;
-    MVMJitHandler *handlers;
-
+    MVMint32       num_handlers; /* for handlers */
     MVMint32       seq_nr;
+    MVMJitHandler *handlers;
 };
 
 MVMJitCode* MVM_jit_compile_graph(MVMThreadContext *tc, MVMJitGraph *graph);
@@ -36,3 +33,11 @@ MVMint32 MVM_jit_enter_code(MVMThreadContext *tc, MVMCompUnit *cu,
 
 #define MVM_JIT_CTRL_DEOPT -1
 #define MVM_JIT_CTRL_NORMAL 0
+
+/* Function for getting effective (JIT/specialized/original) bytecode. */
+MVM_STATIC_INLINE MVMuint8 * MVM_frame_effective_bytecode(MVMFrame *f) {
+    MVMSpeshCandidate *spesh_cand = f->spesh_cand;
+    if (spesh_cand)
+        return spesh_cand->jitcode ? spesh_cand->jitcode->bytecode : spesh_cand->bytecode;
+    return f->static_info->body.bytecode;
+}

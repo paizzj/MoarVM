@@ -1,4 +1,5 @@
 #include "moar.h"
+#include <platform/threads.h>
 
 //~ ffi_type * MVM_nativecall_get_ffi_type(MVMThreadContext *tc, MVMuint64 type_id, void **values, MVMuint64 offset) {
 ffi_type * MVM_nativecall_get_ffi_type(MVMThreadContext *tc, MVMuint64 type_id) {
@@ -172,13 +173,15 @@ static void * unmarshal_callback(MVMThreadContext *tc, MVMObject *callback, MVMO
 
         MVM_callsite_try_intern(tc, &cs);
 
-        callback_data->tc        = tc;
+        callback_data->instance  = tc->instance;
         callback_data->cs        = cs;
         callback_data->target    = callback;
         status                   = ffi_prep_cif(cif, callback_data->convention, (unsigned int)cs->arg_count,
             callback_data->ffi_ret_type, callback_data->ffi_arg_types);
 
         closure                  = ffi_closure_alloc(sizeof(ffi_closure), &cb);
+        if (!closure)
+            MVM_panic(1, "Unable to allocate memory for callback closure");
         ffi_prep_closure_loc(closure, cif, callback_handler, callback_data, cb);
         callback_data->cb        = cb;
 
@@ -210,12 +213,29 @@ static void callback_handler(ffi_cif *cif, void *cb_result, void **cb_args, void
     MVMRegister *args;
     MVMNativeCallback *data = (MVMNativeCallback *)cb_data;
     void           **values = MVM_malloc(sizeof(void *) * (data->cs->arg_count ? data->cs->arg_count : 1));
+    unsigned int interval_id;
+    MVMint32 was_blocked;
+
+    /* Locate the thread. */
+    MVMThreadContext *tc = NULL;
+    MVMThread *thread = data->instance->threads;
+    MVMint64 wanted_thread_id = MVM_platform_thread_id();
+    while (thread) {
+        if (thread->body.native_thread_id == wanted_thread_id) {
+            tc = thread->body.tc;
+            break;
+        }
+        thread = thread->body.next;
+    }
+    if (!tc)
+        MVM_panic(1, "native callback ran on thread unknown to MoarVM");
 
     /* Unblock GC if needed, so this thread can do work. */
-    MVMThreadContext *tc = data->tc;
-    MVMint32 was_blocked = MVM_gc_is_thread_blocked(tc);
+    was_blocked = MVM_gc_is_thread_blocked(tc);
     if (was_blocked)
         MVM_gc_mark_thread_unblocked(tc);
+
+    interval_id = MVM_telemetry_interval_start(tc, "nativecall callback handler");
 
     /* Build a callsite and arguments buffer. */
     args = MVM_malloc(data->num_types * sizeof(MVMRegister));
@@ -296,6 +316,7 @@ static void callback_handler(ffi_cif *cif, void *cb_result, void **cb_args, void
                 args[i - 1].i64 = *(unsigned long long *)cb_args[i - 1];
                 break;
             default:
+                MVM_telemetry_interval_stop(tc, interval_id, "nativecall callback handler failed");
                 MVM_exception_throw_adhoc(tc,
                     "Internal error: unhandled libffi callback argument type");
         }
@@ -340,83 +361,85 @@ static void callback_handler(ffi_cif *cif, void *cb_result, void **cb_args, void
     if (res.o) {
         MVMContainerSpec const *contspec = STABLE(res.o)->container_spec;
         if (contspec && contspec->fetch_never_invokes)
-            contspec->fetch(data->tc, res.o, &res);
+            contspec->fetch(tc, res.o, &res);
     }
     switch (data->typeinfos[0] & MVM_NATIVECALL_ARG_TYPE_MASK) {
         case MVM_NATIVECALL_ARG_VOID:
             break;
         case MVM_NATIVECALL_ARG_CHAR:
-            *(signed char *)cb_result = MVM_nativecall_unmarshal_char(data->tc, res.o);
+            *(signed char *)cb_result = MVM_nativecall_unmarshal_char(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_SHORT:
-            *(signed short *)cb_result = MVM_nativecall_unmarshal_short(data->tc, res.o);
+            *(signed short *)cb_result = MVM_nativecall_unmarshal_short(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_INT:
-            *(signed int *)cb_result = MVM_nativecall_unmarshal_int(data->tc, res.o);
+            *(signed int *)cb_result = MVM_nativecall_unmarshal_int(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_LONG:
-            *(signed long *)cb_result = MVM_nativecall_unmarshal_long(data->tc, res.o);
+            *(signed long *)cb_result = MVM_nativecall_unmarshal_long(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_LONGLONG:
-            *(signed long long *)cb_result = MVM_nativecall_unmarshal_longlong(data->tc, res.o);
+            *(signed long long *)cb_result = MVM_nativecall_unmarshal_longlong(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_FLOAT:
-            *(float *)cb_result = MVM_nativecall_unmarshal_float(data->tc, res.o);
+            *(float *)cb_result = MVM_nativecall_unmarshal_float(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_DOUBLE:
-            *(double *)cb_result = MVM_nativecall_unmarshal_double(data->tc, res.o);
+            *(double *)cb_result = MVM_nativecall_unmarshal_double(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_ASCIISTR:
         case MVM_NATIVECALL_ARG_UTF8STR:
         case MVM_NATIVECALL_ARG_UTF16STR:
-            *(void **)cb_result = MVM_nativecall_unmarshal_string(data->tc, res.o, data->typeinfos[0], NULL);
+            *(void **)cb_result = MVM_nativecall_unmarshal_string(tc, res.o, data->typeinfos[0], NULL);
             break;
         case MVM_NATIVECALL_ARG_CSTRUCT:
-            *(void **)cb_result = MVM_nativecall_unmarshal_cstruct(data->tc, res.o);
+            *(void **)cb_result = MVM_nativecall_unmarshal_cstruct(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_CPOINTER:
-            *(void **)cb_result = MVM_nativecall_unmarshal_cpointer(data->tc, res.o);
+            *(void **)cb_result = MVM_nativecall_unmarshal_cpointer(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_CARRAY:
-            *(void **)cb_result = MVM_nativecall_unmarshal_carray(data->tc, res.o);
+            *(void **)cb_result = MVM_nativecall_unmarshal_carray(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_CUNION:
-            *(void **)cb_result = MVM_nativecall_unmarshal_cunion(data->tc, res.o);
+            *(void **)cb_result = MVM_nativecall_unmarshal_cunion(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_VMARRAY:
-            *(void **)cb_result = MVM_nativecall_unmarshal_vmarray(data->tc, res.o);
+            *(void **)cb_result = MVM_nativecall_unmarshal_vmarray(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_CALLBACK:
-            *(void **)cb_result = unmarshal_callback(data->tc, res.o, data->types[0]);
+            *(void **)cb_result = unmarshal_callback(tc, res.o, data->types[0]);
             break;
         case MVM_NATIVECALL_ARG_UCHAR:
-            *(unsigned char *)cb_result = MVM_nativecall_unmarshal_uchar(data->tc, res.o);
+            *(unsigned char *)cb_result = MVM_nativecall_unmarshal_uchar(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_USHORT:
-            *(unsigned short *)cb_result = MVM_nativecall_unmarshal_ushort(data->tc, res.o);
+            *(unsigned short *)cb_result = MVM_nativecall_unmarshal_ushort(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_UINT:
-            *(unsigned int *)cb_result = MVM_nativecall_unmarshal_uint(data->tc, res.o);
+            *(unsigned int *)cb_result = MVM_nativecall_unmarshal_uint(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_ULONG:
-            *(unsigned long *)cb_result = MVM_nativecall_unmarshal_ulong(data->tc, res.o);
+            *(unsigned long *)cb_result = MVM_nativecall_unmarshal_ulong(tc, res.o);
             break;
         case MVM_NATIVECALL_ARG_ULONGLONG:
-            *(unsigned long long *)cb_result = MVM_nativecall_unmarshal_ulonglong(data->tc, res.o);
+            *(unsigned long long *)cb_result = MVM_nativecall_unmarshal_ulonglong(tc, res.o);
             break;
         default:
-            MVM_exception_throw_adhoc(data->tc,
+                MVM_telemetry_interval_stop(tc, interval_id, "nativecall callback handler failed");
+            MVM_exception_throw_adhoc(tc,
                 "Internal error: unhandled libffi callback return type");
     }
 
     /* Clean up. */
     MVM_gc_root_temp_pop_n(tc, num_roots);
     MVM_free(args);
-    MVM_free(cif);
 
     /* Re-block GC if needed, so other threads will be able to collect. */
     if (was_blocked)
         MVM_gc_mark_thread_blocked(tc);
+
+    MVM_telemetry_interval_stop(tc, interval_id, "nativecall callback handler");
 }
 
 #define handle_arg(what, cont_X, dc_type, reg_slot, unmarshal_fun) do { \
@@ -476,8 +499,13 @@ MVMObject * MVM_nativecall_invoke(MVMThreadContext *tc, MVMObject *res_type,
     void     *entry_point = body->entry_point;
     void    **values      = MVM_malloc(sizeof(void *) * (num_args ? num_args : 1));
 
+    unsigned int interval_id;
+
     ffi_cif cif;
     ffi_status status  = ffi_prep_cif(&cif, body->convention, (unsigned int)num_args, body->ffi_ret_type, body->ffi_arg_types);
+
+    interval_id = MVM_telemetry_interval_start(tc, "nativecall invoke");
+    MVM_telemetry_interval_annotate((uintptr_t)entry_point, interval_id, "nc entrypoint");
 
     /* Process arguments. */
     for (i = 0; i < num_args; i++) {
@@ -582,6 +610,7 @@ MVMObject * MVM_nativecall_invoke(MVMThreadContext *tc, MVMObject *res_type,
                 handle_arg("integer", cont_i, unsigned long long, i64, MVM_nativecall_unmarshal_ulonglong);
                 break;
             default:
+                MVM_telemetry_interval_stop(tc, interval_id, "nativecall invoke failed");
                 MVM_exception_throw_adhoc(tc, "Internal error: unhandled libffi argument type");
         }
     }
@@ -686,6 +715,7 @@ MVMObject * MVM_nativecall_invoke(MVMThreadContext *tc, MVMObject *res_type,
                     handle_ret(tc, unsigned long long, ffi_arg, MVM_nativecall_make_int);
                     break;
                 default:
+                    MVM_telemetry_interval_stop(tc, interval_id, "nativecall invoke failed");
                     MVM_exception_throw_adhoc(tc, "Internal error: unhandled libffi return type");
             }
         }
@@ -737,6 +767,7 @@ MVMObject * MVM_nativecall_invoke(MVMThreadContext *tc, MVMObject *res_type,
                         (MVMint64)*(void **)*(void **)values[i]);
                     break;
                 default:
+                    MVM_telemetry_interval_stop(tc, interval_id, "nativecall invoke failed");
                     MVM_exception_throw_adhoc(tc, "Internal error: unhandled libffi argument type");
             }
         }
@@ -753,6 +784,8 @@ MVMObject * MVM_nativecall_invoke(MVMThreadContext *tc, MVMObject *res_type,
 
     if (values)
         MVM_free(values);
+
+    MVM_telemetry_interval_stop(tc, interval_id, "nativecall invoke");
 
     return result;
 }

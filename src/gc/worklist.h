@@ -37,11 +37,14 @@ struct MVMGCWorklist {
         if (*item_to_add) { \
             if ((*item_to_add)->owner == 0) \
                 MVM_panic(1, "Zeroed owner in item added to GC worklist"); \
+            if ((*item_to_add)->owner > tc->instance->next_user_thread_id) \
+                MVM_panic(1, "Invalid owner in item added to GC worklist"); \
             if ((*item_to_add)->flags & MVM_CF_STABLE == 0 && !STABLE(*item_to_add)) \
                 MVM_panic(1, "NULL STable in item added to GC worklist"); \
-            if (*item_to_add >= (MVMCollectable *)tc->nursery_alloc && \
-                    *item_to_add < (MVMCollectable *)tc->nursery_alloc_limit) \
-                MVM_panic(1, "Adding item to past fromspace to GC worklist"); \
+            if ((char *)*item_to_add >= (char *)tc->nursery_alloc && \
+                    (char *)*item_to_add < (char *)tc->nursery_alloc_limit) \
+                MVM_panic(1, "Adding pointer %p to past fromspace to GC worklist", \
+                    *item_to_add); \
         } \
         if (*item_to_add && (worklist->include_gen2 || !((*item_to_add)->flags & MVM_CF_SECOND_GEN))) { \
             if (worklist->items == worklist->alloc) \

@@ -12,6 +12,9 @@ typedef struct {
 MVMObject * MVM_thread_new(MVMThreadContext *tc, MVMObject *invokee, MVMint64 app_lifetime) {
     MVMThread *thread;
     MVMThreadContext *child_tc;
+    unsigned int interval_id;
+
+    interval_id = MVM_telemetry_interval_start(tc, "spawning a new thread off of me");
 
     /* Create the Thread object and stash code to run and lifetime. */
     MVMROOT(tc, invokee, {
@@ -21,12 +24,19 @@ MVMObject * MVM_thread_new(MVMThreadContext *tc, MVMObject *invokee, MVMint64 ap
     MVM_ASSIGN_REF(tc, &(thread->common.header), thread->body.invokee, invokee);
     thread->body.app_lifetime = app_lifetime;
 
-    /* Create a new thread context and set it up a little. */
-    child_tc = MVM_tc_create(tc->instance);
+    /* Try to create the new threadcontext. Can throw if libuv can't
+     * create a loop for it for some reason (i.e. too many open files) */
+    MVMROOT(tc, thread, {
+        child_tc = MVM_tc_create(tc, tc->instance);
+    });
+
+    /* Set up the new threadcontext a little. */
     child_tc->thread_obj = thread;
     child_tc->thread_id = 1 + MVM_incr(&tc->instance->next_user_thread_id);
         /* Add one, since MVM_incr returns original. */
     thread->body.tc = child_tc;
+
+    MVM_telemetry_interval_stop(child_tc, interval_id, "i'm the newly spawned thread.");
 
     /* Also make a copy of the thread ID in the thread object itself, so it
      * is available once the thread dies and its ThreadContext is gone. */
@@ -43,13 +53,6 @@ static void thread_initial_invoke(MVMThreadContext *tc, void *data) {
     MVMThread *thread = (MVMThread *)ts->thread_obj;
     MVMObject *invokee = thread->body.invokee;
     thread->body.invokee = NULL;
-
-    /* Set up the cached current usecapture CallCapture (done here so
-     * we allocate it on the correct thread, and once the thread is
-     * active). */
-    MVMROOT(tc, invokee, {
-        tc->cur_usecapture = MVM_repr_alloc_init(tc, tc->instance->CallCapture);
-    });
 
     /* Create initial frame, which sets up all of the interpreter state also. */
     invokee = MVM_frame_find_invokee(tc, invokee, NULL);
@@ -72,6 +75,9 @@ static void start_thread(void *data) {
     /* wait for the GC to finish if it's not finished stealing us. */
     MVM_gc_mark_thread_unblocked(tc);
     tc->thread_obj->body.stage = MVM_thread_stage_started;
+
+    /* Create a spesh log for this thread. */
+    MVM_spesh_log_initialize_thread(tc, 0);
 
     /* Enter the interpreter, to run code. */
     MVM_interp_run(tc, thread_initial_invoke, ts);
@@ -97,33 +103,56 @@ static void start_thread(void *data) {
 /* Begins execution of a thread. */
 void MVM_thread_run(MVMThreadContext *tc, MVMObject *thread_obj) {
     MVMThread *child = (MVMThread *)thread_obj;
-    int status;
+    int status, added;
     ThreadStart *ts;
 
     if (REPR(child)->ID == MVM_REPR_ID_MVMThread) {
-        MVMThread * volatile *threads;
         MVMThreadContext *child_tc = child->body.tc;
-
-        /* Move thread to starting stage. */
-        child->body.stage = MVM_thread_stage_starting;
-
-        /* Create thread state, to pass to the thread start callback. */
-        ts = MVM_malloc(sizeof(ThreadStart));
-        ts->tc = child_tc;
-        ts->thread_obj = thread_obj;
-
-        /* Push this to the *child* tc's temp roots. */
-        MVM_gc_root_temp_push(child_tc, (MVMCollectable **)&ts->thread_obj);
 
         /* Mark thread as GC blocked until the thread actually starts. */
         MVM_gc_mark_thread_blocked(child_tc);
 
-        /* Push to starting threads list */
-        threads = &tc->instance->threads;
-        do {
-            MVMThread *curr = *threads;
-            MVM_ASSIGN_REF(tc, &(child->common.header), child->body.next, curr);
-        } while (MVM_casptr(threads, child->body.next, child) != child->body.next);
+        /* Create thread state, to pass to the thread start callback. */
+        ts = MVM_malloc(sizeof(ThreadStart));
+        ts->tc = child_tc;
+
+        /* Push to starting threads list. We may need to retry this if we are
+         * asked to join a GC run at this point (since the GC would already
+         * have taken a snapshot of the thread list, so it's not safe to add
+         * another at this point). */
+        added = 0;
+        while (!added) {
+            uv_mutex_lock(&tc->instance->mutex_threads);
+            if (MVM_load(&tc->gc_status) == MVMGCStatus_NONE) {
+                /* Insert into list. */
+                MVM_ASSIGN_REF(tc, &(child->common.header), child->body.next,
+                    tc->instance->threads);
+                tc->instance->threads = child;
+
+                /* Store the thread object in the thread start information and
+                 * keep it alive by putting it in the *child* tc's temp roots. */
+                ts->thread_obj = thread_obj;
+                MVM_gc_root_temp_push(child_tc, (MVMCollectable **)&ts->thread_obj);
+
+                /* Move thread to starting stage. */
+                child->body.stage = MVM_thread_stage_starting;
+
+                /* Mark us done and unlock the mutex; any GC run will now have
+                 * a consistent view of the thread list and can safely run. */
+                added = 1;
+                uv_mutex_unlock(&tc->instance->mutex_threads);
+            }
+            else {
+                /* Another thread decided we'll GC now. Release mutex, and
+                 * do the GC, making sure thread_obj and child are marked. */
+                uv_mutex_unlock(&tc->instance->mutex_threads);
+                MVMROOT(tc, thread_obj, {
+                MVMROOT(tc, child, {
+                    GC_SYNC_POINT(tc);
+                });
+                });
+            }
+        }
 
         /* Do the actual thread creation. */
         status = uv_thread_create(&child->body.thread, start_thread, ts);
@@ -193,6 +222,7 @@ MVMint64 MVM_thread_native_id(MVMThreadContext *tc, MVMObject *thread_obj) {
 
 /* Yields control to another thread. */
 void MVM_thread_yield(MVMThreadContext *tc) {
+    MVM_telemetry_timestamp(tc, "thread yielding");
     MVM_platform_thread_yield();
 }
 
@@ -253,3 +283,4 @@ void MVM_thread_join_foreground(MVMThreadContext *tc) {
         }
     }
 }
+

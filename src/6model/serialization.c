@@ -86,6 +86,14 @@
 #define STABLE_HAS_HLL_OWNER                0x40
 #define STABLE_HAS_HLL_ROLE                 0x80
 
+#define GROW_TABLE(table, alloc) \
+        table = (char *)MVM_recalloc( \
+            table, \
+            alloc, \
+            alloc * 2 \
+        ); \
+        alloc *= 2;
+
 /* Endian translation (file format is little endian, so on big endian we need
  * to twiddle. */
 #ifdef MVM_BIGENDIAN
@@ -276,8 +284,7 @@ static MVMuint32 get_sc_id(MVMThreadContext *tc, MVMSerializationWriter *writer,
      * space in the dependencies table; grow if not. */
     offset = num_deps * DEP_TABLE_ENTRY_SIZE;
     if (offset + DEP_TABLE_ENTRY_SIZE > writer->dependencies_table_alloc) {
-        writer->dependencies_table_alloc *= 2;
-        writer->root.dependencies_table = (char *)MVM_realloc(writer->root.dependencies_table, writer->dependencies_table_alloc);
+        GROW_TABLE(writer->root.dependencies_table, writer->dependencies_table_alloc);
     }
 
     /* Add dependency. */
@@ -523,6 +530,22 @@ static void write_code_ref(MVMThreadContext *tc, MVMSerializationWriter *writer,
     write_locate_sc_and_index(tc, writer, sc_id, idx);
 }
 
+void throw_closure_serialization_error(MVMThreadContext *tc, MVMCode *closure, const char *message) {
+    MVMString *file;
+    MVMint32 line;
+    MVM_gc_enter_from_allocator(tc); /* opportunity for creating a heap snapshot for debugging */
+    MVM_code_location_out(tc, (MVMObject *)closure, &file, &line);
+    {
+        char *c_name = MVM_string_utf8_encode_C_string(tc,
+                (closure->body.sf)->body.name);
+        char *c_file = MVM_string_utf8_encode_C_string(tc, file);
+        char *waste[] = { c_name, c_file, NULL };
+        MVM_exception_throw_adhoc_free(tc, waste,
+            "Serialization Error: %s '%s' (%s:%d)",
+            message, c_name, c_file, line);
+    }
+}
+
 /* Given a closure, locate the static code reference it was originally cloned
  * from. */
 static MVMObject * closure_to_static_code_ref(MVMThreadContext *tc, MVMObject *closure, MVMint64 fatal) {
@@ -530,18 +553,11 @@ static MVMObject * closure_to_static_code_ref(MVMThreadContext *tc, MVMObject *c
 
     if (scr == NULL || MVM_sc_get_obj_sc(tc, scr) == NULL) {
         if (fatal) {
-            MVMString *file;
-            MVMint32 line;
-            MVM_code_location_out(tc, closure, &file, &line);
-            {
-                char *c_name = MVM_string_utf8_encode_C_string(tc,
-                        (((MVMCode *)closure)->body.sf)->body.name);
-                char *c_file = MVM_string_utf8_encode_C_string(tc, file);
-                char *waste[] = { c_name, c_file, NULL };
-                MVM_exception_throw_adhoc_free(tc, waste,
-                    "Serialization Error: missing static code ref for closure '%s' (%s:%d)",
-                    c_name, c_file, line);
-            }
+            throw_closure_serialization_error(
+                tc,
+                (MVMCode *)closure,
+                "missing static code ref for closure"
+            );
         }
         return NULL;
     }
@@ -550,7 +566,7 @@ static MVMObject * closure_to_static_code_ref(MVMThreadContext *tc, MVMObject *c
 
 /* Takes an outer context that is potentially to be serialized. Checks if it
  * is of interest, and if so sets it up to be serialized. */
-static MVMint32 get_serialized_context_idx(MVMThreadContext *tc, MVMSerializationWriter *writer, MVMFrame *ctx) {
+static MVMint32 get_serialized_context_idx(MVMThreadContext *tc, MVMSerializationWriter *writer, MVMFrame *ctx, MVMCode *closure) {
      if (OBJ_IS_NULL(MVM_sc_get_frame_sc(tc, ctx))) {
         /* Make sure we should chase a level down. */
         if (OBJ_IS_NULL(closure_to_static_code_ref(tc, ctx->code_ref, 0))) {
@@ -570,14 +586,19 @@ static MVMint32 get_serialized_context_idx(MVMThreadContext *tc, MVMSerializatio
     else {
         MVMint64 i, c;
         if (MVM_sc_get_frame_sc(tc, ctx) != writer->root.sc)
-            MVM_exception_throw_adhoc(tc,
-                "Serialization Error: reference to context outside of SC");
+            throw_closure_serialization_error(tc,
+                closure,
+                "reference to context outside of SC for"
+            );
         c = writer->num_contexts;
         for (i = 0; i < c; i++)
             if (writer->contexts_list[i] == ctx)
                 return (MVMint32)i + 1;
-        MVM_exception_throw_adhoc(tc,
-            "Serialization Error: could not locate outer context in current SC");
+        throw_closure_serialization_error(
+            tc,
+            closure,
+            "could not locate outer context in current SC for"
+        );
     }
 }
 
@@ -588,7 +609,7 @@ static MVMint32 get_serialized_outer_context_idx(MVMThreadContext *tc, MVMSerial
         return 0;
     if (((MVMCode *)closure)->body.outer == NULL)
         return 0;
-    return get_serialized_context_idx(tc, writer, ((MVMCode *)closure)->body.outer);
+    return get_serialized_context_idx(tc, writer, ((MVMCode *)closure)->body.outer, (MVMCode *)closure);
 }
 
 /* Takes a closure that needs to be serialized. Makes an entry in the closures
@@ -604,8 +625,7 @@ static void serialize_closure(MVMThreadContext *tc, MVMSerializationWriter *writ
     /* Ensure there's space in the closures table; grow if not. */
     MVMint32 offset = writer->root.num_closures * CLOSURES_TABLE_ENTRY_SIZE;
     if (offset + CLOSURES_TABLE_ENTRY_SIZE > writer->closures_table_alloc) {
-        writer->closures_table_alloc *= 2;
-        writer->root.closures_table = (char *)MVM_realloc(writer->root.closures_table, writer->closures_table_alloc);
+        GROW_TABLE(writer->root.closures_table, writer->closures_table_alloc);
     }
 
     /* Get the index of the context (which will add it to the todo list if
@@ -660,6 +680,9 @@ void MVM_serialization_write_ref(MVMThreadContext *tc, MVMSerializationWriter *w
         discrim = REFVAR_VM_NULL;
     }
     else if (REPR(ref)->ID == MVM_REPR_ID_MVMOSHandle) {
+        discrim = REFVAR_VM_NULL;
+    }
+    else if (REPR(ref)->ID == MVM_REPR_ID_Decoder && IS_CONCRETE(ref)) {
         discrim = REFVAR_VM_NULL;
     }
     else if (STABLE(ref) == STABLE(tc->instance->boot_types.BOOTInt) && IS_CONCRETE(ref)) {
@@ -787,7 +810,7 @@ static MVMString * concatenate_outputs(MVMThreadContext *tc, MVMSerializationWri
     output_size += MVM_ALIGN_SECTION(writer->param_interns_data_offset);
 
     /* Allocate a buffer that size. */
-    output = (char *)MVM_malloc(output_size);
+    output = (char *)MVM_calloc(1, output_size);
 
     /* Write version into header. */
     write_int32(output, 0, CURRENT_VERSION);
@@ -961,8 +984,7 @@ static void serialize_stable(MVMThreadContext *tc, MVMSerializationWriter *write
     /* Ensure there's space in the STables table; grow if not. */
     MVMint32 offset = writer->root.num_stables * STABLES_TABLE_ENTRY_SIZE;
     if (offset + STABLES_TABLE_ENTRY_SIZE > writer->stables_table_alloc) {
-        writer->stables_table_alloc *= 2;
-        writer->root.stables_table = (char *)MVM_realloc(writer->root.stables_table, writer->stables_table_alloc);
+        GROW_TABLE(writer->root.stables_table, writer->stables_table_alloc);
     }
 
     /* Make STables table entry. */
@@ -1149,8 +1171,7 @@ static void serialize_object(MVMThreadContext *tc, MVMSerializationWriter *write
     /* Ensure there's space in the objects table; grow if not. */
     offset = writer->root.num_objects * OBJECTS_TABLE_ENTRY_SIZE;
     if (offset + OBJECTS_TABLE_ENTRY_SIZE > writer->objects_table_alloc) {
-        writer->objects_table_alloc *= 2;
-        writer->root.objects_table = (char *)MVM_realloc(writer->root.objects_table, writer->objects_table_alloc);
+        GROW_TABLE(writer->root.objects_table, writer->objects_table_alloc);
     }
 
     /* Increment count of objects in the table. */
@@ -1210,8 +1231,7 @@ static void serialize_context(MVMThreadContext *tc, MVMSerializationWriter *writ
     /* Ensure there's space in the STables table; grow if not. */
     offset = writer->root.num_contexts * CONTEXTS_TABLE_ENTRY_SIZE;
     if (offset + CONTEXTS_TABLE_ENTRY_SIZE > writer->contexts_table_alloc) {
-        writer->contexts_table_alloc *= 2;
-        writer->root.contexts_table = (char *)MVM_realloc(writer->root.contexts_table, writer->contexts_table_alloc);
+        GROW_TABLE(writer->root.contexts_table, writer->contexts_table_alloc);
     }
 
     /* Make contexts table entry. */
@@ -1223,7 +1243,7 @@ static void serialize_context(MVMThreadContext *tc, MVMSerializationWriter *writ
      * be serialized. */
     if (frame->outer)
         write_int32(writer->root.contexts_table, offset + 12,
-            get_serialized_context_idx(tc, writer, frame->outer));
+            get_serialized_context_idx(tc, writer, frame->outer, NULL));
     else
         write_int32(writer->root.contexts_table, offset + 12, 0);
 
@@ -1355,28 +1375,28 @@ MVMString * MVM_serialization_serialize(MVMThreadContext *tc, MVMSerializationCo
     writer->root.sc             = sc;
     writer->codes_list          = sc->body->root_codes;
     writer->root.string_heap    = empty_string_heap;
-    writer->root.dependent_scs  = MVM_malloc(sizeof(MVMSerializationContext *));
+    writer->root.dependent_scs  = MVM_calloc(1, sizeof(MVMSerializationContext *));
     writer->seen_strings        = MVM_repr_alloc_init(tc, tc->instance->boot_types.BOOTHash);
 
     /* Allocate initial memory space for storing serialized tables and data. */
     writer->dependencies_table_alloc = DEP_TABLE_ENTRY_SIZE * 4;
-    writer->root.dependencies_table  = (char *)MVM_malloc(writer->dependencies_table_alloc);
+    writer->root.dependencies_table  = (char *)MVM_calloc(1, writer->dependencies_table_alloc);
     writer->stables_table_alloc      = STABLES_TABLE_ENTRY_SIZE * STABLES_TABLE_ENTRIES_GUESS;
-    writer->root.stables_table       = (char *)MVM_malloc(writer->stables_table_alloc);
+    writer->root.stables_table       = (char *)MVM_calloc(1, writer->stables_table_alloc);
     writer->objects_table_alloc      = OBJECTS_TABLE_ENTRY_SIZE * MAX(sc_elems, 1);
-    writer->root.objects_table       = (char *)MVM_malloc(writer->objects_table_alloc);
+    writer->root.objects_table       = (char *)MVM_calloc(1, writer->objects_table_alloc);
     writer->stables_data_alloc       = DEFAULT_STABLE_DATA_SIZE;
-    writer->root.stables_data        = (char *)MVM_malloc(writer->stables_data_alloc);
+    writer->root.stables_data        = (char *)MVM_calloc(1, writer->stables_data_alloc);
     writer->objects_data_alloc       = OBJECT_SIZE_GUESS * MAX(sc_elems, 1);
-    writer->root.objects_data        = (char *)MVM_malloc(writer->objects_data_alloc);
+    writer->root.objects_data        = (char *)MVM_calloc(1, writer->objects_data_alloc);
     writer->closures_table_alloc     = CLOSURES_TABLE_ENTRY_SIZE * CLOSURES_TABLE_ENTRIES_GUESS;
-    writer->root.closures_table      = (char *)MVM_malloc(writer->closures_table_alloc);
+    writer->root.closures_table      = (char *)MVM_calloc(1, writer->closures_table_alloc);
     writer->contexts_table_alloc     = CONTEXTS_TABLE_ENTRY_SIZE * CONTEXTS_TABLE_ENTRIES_GUESS;
-    writer->root.contexts_table      = (char *)MVM_malloc(writer->contexts_table_alloc);
+    writer->root.contexts_table      = (char *)MVM_calloc(1, writer->contexts_table_alloc);
     writer->contexts_data_alloc      = DEFAULT_CONTEXTS_DATA_SIZE;
-    writer->root.contexts_data       = (char *)MVM_malloc(writer->contexts_data_alloc);
+    writer->root.contexts_data       = (char *)MVM_calloc(1, writer->contexts_data_alloc);
     writer->param_interns_data_alloc = DEFAULT_PARAM_INTERNS_DATA_SIZE;
-    writer->root.param_interns_data  = (char *)MVM_malloc(writer->param_interns_data_alloc);
+    writer->root.param_interns_data  = (char *)MVM_calloc(1, writer->param_interns_data_alloc);
 
     /* Initialize MVMString heap so first entry is the NULL MVMString. */
     MVM_repr_push_s(tc, empty_string_heap, NULL);
@@ -1650,7 +1670,7 @@ char *MVM_serialization_read_cstr(MVMThreadContext *tc, MVMSerializationReader *
         strbuf[len] = 0;
         *(reader->cur_read_offset) += len;
     } else if (len < 0) {
-        fail_deserialize(tc, reader, "Cannot read a c string with negative length %li.", len);
+        fail_deserialize(tc, reader, "Cannot read a c string with negative length %"PRIi64".", len);
     }
     return strbuf;
 }
@@ -2951,7 +2971,7 @@ static void repossess(MVMThreadContext *tc, MVMSerializationReader *reader, MVMi
         if (MVM_sc_get_stable_sc(tc, orig_st) != orig_sc)
             fail_deserialize(tc, reader,
                 "STable conflict detected during deserialization.\n"
-                "(Probable attempt to load two modules that cannot be loaded together).");
+                "(Probable attempt to load a mutated module or modules that cannot be loaded together).");
 
         /* Put it into STables root set at the apporpriate slot. */
         slot = read_int32(table_row, 4);

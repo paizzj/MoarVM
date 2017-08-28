@@ -1,7 +1,7 @@
 #include "moar.h"
 
 /* This representation's function pointer table. */
-static const MVMREPROps this_repr;
+static const MVMREPROps ReentrantMutex_this_repr;
 
 /* Populates the object body with a mutex. */
 static void initialize_mutex(MVMThreadContext *tc, MVMReentrantMutexBody *rm) {
@@ -15,7 +15,7 @@ static void initialize_mutex(MVMThreadContext *tc, MVMReentrantMutexBody *rm) {
 /* Creates a new type object of this representation, and associates it with
  * the given HOW. */
 static MVMObject * type_object_for(MVMThreadContext *tc, MVMObject *HOW) {
-    MVMSTable *st  = MVM_gc_allocate_stable(tc, &this_repr, HOW);
+    MVMSTable *st  = MVM_gc_allocate_stable(tc, &ReentrantMutex_this_repr, HOW);
 
     MVMROOT(tc, st, {
         MVMObject *obj = MVM_gc_allocate_type_object(tc, st);
@@ -82,10 +82,10 @@ static void deserialize(MVMThreadContext *tc, MVMSTable *st, MVMObject *root, vo
 
 /* Initializes the representation. */
 const MVMREPROps * MVMReentrantMutex_initialize(MVMThreadContext *tc) {
-    return &this_repr;
+    return &ReentrantMutex_this_repr;
 }
 
-static const MVMREPROps this_repr = {
+static const MVMREPROps ReentrantMutex_this_repr = {
     type_object_for,
     MVM_gc_allocate_object,
     initialize,
@@ -117,12 +117,15 @@ static const MVMREPROps this_repr = {
 
 /* Locks the mutex. */
 void MVM_reentrantmutex_lock(MVMThreadContext *tc, MVMReentrantMutex *rm) {
+    unsigned int interval_id;
     if (MVM_load(&rm->body.holder_id) == tc->thread_id) {
         /* We already hold the lock; bump the count. */
         MVM_incr(&rm->body.lock_count);
     }
     else {
         /* Not holding the lock; obtain it. */
+        /*interval_id = MVM_telemetry_interval_start(tc, "ReentrantMutex obtains lock");*/
+        /*MVM_telemetry_interval_annotate(rm->body.mutex, interval_id, "lock in question");*/
         MVMROOT(tc, rm, {
             MVM_gc_mark_thread_blocked(tc);
             uv_mutex_lock(rm->body.mutex);
@@ -131,6 +134,7 @@ void MVM_reentrantmutex_lock(MVMThreadContext *tc, MVMReentrantMutex *rm) {
         MVM_store(&rm->body.holder_id, tc->thread_id);
         MVM_store(&rm->body.lock_count, 1);
         tc->num_locks++;
+        /*MVM_telemetry_interval_stop(tc, interval_id, "ReentrantMutex obtained lock");*/
     }
 }
 
@@ -143,6 +147,7 @@ void MVM_reentrantmutex_unlock(MVMThreadContext *tc, MVMReentrantMutex *rm) {
             MVM_store(&rm->body.holder_id, 0);
             uv_mutex_unlock(rm->body.mutex);
             tc->num_locks--;
+            /*MVM_telemetry_timestamp(rm->body.mutex, "this ReentrantMutex unlocked");*/
         }
     }
     else {

@@ -58,6 +58,11 @@ struct MVMNormalizer {
     /* If we should translate the \r\n grapheme to \n (only applicable when
      * normalizing to NFG). */
     MVMint32 translate_newlines;
+
+    MVMint32 prepend_buffer;
+
+    MVMint32 regional_indicator;
+
 };
 
 /* Guts-y functions, called by the API level ones below. */
@@ -75,13 +80,14 @@ MVM_STATIC_INLINE MVMint32 MVM_unicode_normalizer_process_codepoint(MVMThreadCon
      * far in normalized form without having to consider them into the
      * normalization process. The exception is if we're computing NFG, and
      * we got \r, which can form a grapheme in the case of \r\n. */
-    if (in < 0x20 || (in >= 0x7F && in <= 0x9F) || in == 0xAD)
+    if (in < 0x20 || (0x7F <= in && in <= 0x9F) || in == 0xAD)
         if (!(MVM_NORMALIZE_GRAPHEME(n->form) && in == 0x0D))
             return MVM_unicode_normalizer_process_codepoint_norm_terminator(tc, n, in, out);
 
     /* Fast-paths apply when the codepoint to consider is too low to have any
-     * interesting properties in the target normalization form. */
-    if (in < n->first_significant) {
+     * interesting properties in the target normalization form AND
+     * it doesn't follow a prepend character */
+    if (in < n->first_significant && !n->prepend_buffer) {
         if (MVM_NORMALIZE_COMPOSE(n->form)) {
             /* For the composition fast path we always have to know that we've
             * seen two codepoints in a row that are below those needing a full
@@ -155,7 +161,7 @@ MVM_STATIC_INLINE MVMGrapheme32 MVM_unicode_normalizer_get_grapheme(MVMThreadCon
 }
 
 /* Setup and teardown of the MVMNormalizer struct. */
-MVMNormalization MVN_unicode_normalizer_form(MVMThreadContext *tc, MVMint64 form_in);
+MVMNormalization MVM_unicode_normalizer_form(MVMThreadContext *tc, MVMint64 form_in);
 void MVM_unicode_normalizer_init(MVMThreadContext *tc, MVMNormalizer *n, MVMNormalization norm);
 void MVM_unicode_normalizer_translate_newlines(MVMThreadContext *tc, MVMNormalizer *n);
 void MVM_unicode_normalizer_cleanup(MVMThreadContext *tc, MVMNormalizer *n);
@@ -171,3 +177,23 @@ MVMString * MVM_unicode_codepoints_c_array_to_nfg_string(MVMThreadContext *tc, M
 
 /* High-level function to produce an array of codepoints from a string. */
 void MVM_unicode_string_to_codepoints(MVMThreadContext *tc, MVMString *s, MVMNormalization form, MVMObject *out);
+
+/* faster atoi function */
+MVM_STATIC_INLINE MVMint32 fast_atoi( const char * dec_str ) {
+    MVMint32 value = 0;
+    while( *dec_str ) {
+        value = value*10 + (*dec_str++ - '0');
+    }
+    return value;
+}
+MVMint64 MVM_unicode_relative_ccc(MVMThreadContext *tc, MVMCodepoint cp);
+MVMint32 MVM_unicode_normalize_should_break(MVMThreadContext *tc, MVMCodepoint a, MVMCodepoint b, MVMNormalizer *norm);
+MVMint64 MVM_unicode_relative_ccc(MVMThreadContext *tc, MVMCodepoint cp);
+MVMint32 MVM_string_is_control_full(MVMThreadContext *tc, MVMCodepoint in);
+/* Function for choosing the appropriate line-ending grapheme depending on if
+ * newline translation is enabled. */
+MVM_STATIC_INLINE MVMGrapheme32 MVM_unicode_normalizer_translated_crlf(MVMThreadContext *tc, MVMNormalizer *n) {
+    return n->translate_newlines
+        ? '\n'
+        : MVM_nfg_crlf_grapheme(tc);
+}

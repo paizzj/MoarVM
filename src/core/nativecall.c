@@ -337,7 +337,7 @@ void * MVM_nativecall_unmarshal_carray(MVMThreadContext *tc, MVMObject *value) {
 void * MVM_nativecall_unmarshal_vmarray(MVMThreadContext *tc, MVMObject *value) {
     if (!IS_CONCRETE(value))
         return NULL;
-    else if (REPR(value)->ID == MVM_REPR_ID_MVMArray) {
+    else if (REPR(value)->ID == MVM_REPR_ID_VMArray) {
         MVMArrayBody *body          = &((MVMArray *)value)->body;
         MVMArrayREPRData *repr_data = (MVMArrayREPRData *)STABLE(value)->REPR_data;
         size_t start_pos            = body->start * repr_data->elem_size;
@@ -378,6 +378,8 @@ void MVM_nativecall_build(MVMThreadContext *tc, MVMObject *site, MVMString *lib,
     MVMint8  keep_sym_name = 0;
     MVMint16 i;
 
+    unsigned int interval_id = MVM_telemetry_interval_start(tc, "building native call");
+
     MVMObject *entry_point_o = (MVMObject *)MVM_repr_at_key_o(tc, ret_info,
         tc->instance->str_consts.entry_point);
 
@@ -386,11 +388,12 @@ void MVM_nativecall_build(MVMThreadContext *tc, MVMObject *site, MVMString *lib,
 
     /* Try to load the library. */
     body->lib_name = lib_name;
-    body->lib_handle = MVM_nativecall_load_lib(strlen(lib_name) ? lib_name : NULL);
+    body->lib_handle = MVM_nativecall_load_lib(lib_name[0] ? lib_name : NULL);
 
     if (!body->lib_handle) {
         char *waste[] = { lib_name, NULL };
         MVM_free(sym_name);
+        MVM_telemetry_interval_stop(tc, interval_id, "error building native call");
         MVM_exception_throw_adhoc_free(tc, waste, "Cannot locate native library '%s': %s", lib_name, dlerror());
     }
 
@@ -405,12 +408,15 @@ void MVM_nativecall_build(MVMThreadContext *tc, MVMObject *site, MVMString *lib,
         body->entry_point = MVM_nativecall_find_sym(body->lib_handle, sym_name);
         if (!body->entry_point) {
             char *waste[] = { sym_name, lib_name, NULL };
+            MVM_telemetry_interval_stop(tc, interval_id, "error building native call");
             MVM_exception_throw_adhoc_free(tc, waste, "Cannot locate symbol '%s' in native library '%s'",
                 sym_name, lib_name);
         }
         body->sym_name = sym_name;
         keep_sym_name     = 1;
     }
+
+    MVM_telemetry_interval_annotate_dynamic((uintptr_t)body->entry_point, interval_id, body->sym_name);
 
     if (keep_sym_name == 0) {
         MVM_free(sym_name);
@@ -446,6 +452,8 @@ void MVM_nativecall_build(MVMThreadContext *tc, MVMObject *site, MVMString *lib,
 #ifdef HAVE_LIBFFI
     body->ffi_ret_type = MVM_nativecall_get_ffi_type(tc, body->ret_type);
 #endif
+
+    MVM_telemetry_interval_stop(tc, interval_id, "nativecall built");
 }
 
 static MVMObject * nativecall_cast(MVMThreadContext *tc, MVMObject *target_spec, MVMObject *target_type, void *cpointer_body) {
@@ -601,7 +609,7 @@ MVMObject * MVM_nativecall_global(MVMThreadContext *tc, MVMString *lib, MVMStrin
     MVMObject *ret = NULL;
 
     /* Try to load the library. */
-    lib_handle = MVM_nativecall_load_lib(strlen(lib_name) ? lib_name : NULL);
+    lib_handle = MVM_nativecall_load_lib(lib_name[0] ? lib_name : NULL);
     if (!lib_handle) {
         char *waste[] = { lib_name, NULL };
         MVM_free(sym_name);
@@ -646,7 +654,7 @@ MVMObject * MVM_nativecall_cast(MVMThreadContext *tc, MVMObject *target_spec, MV
         data_body = MVM_nativecall_unmarshal_cpointer(tc, source);
     else if (REPR(source)->ID == MVM_REPR_ID_MVMCArray)
         data_body = MVM_nativecall_unmarshal_carray(tc, source);
-    else if (REPR(source)->ID == MVM_REPR_ID_MVMArray)
+    else if (REPR(source)->ID == MVM_REPR_ID_VMArray)
         data_body = MVM_nativecall_unmarshal_vmarray(tc, source);
     else
         MVM_exception_throw_adhoc(tc,
